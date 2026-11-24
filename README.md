@@ -11,11 +11,13 @@ Runs out-of-the-box with **zero external dependencies**
 
 > [!IMPORTANT]
 > **Activating Rich Presence**:  
-> Each time you start MyGo, open **Discord Status** once from the source menu in the top-left. After the helper starts, switch back to the NetEase Cloud Music source (or your preferred source like YouTube Music, Spotify, etc.) and play a track.
+> Each time you start MyGo, open **Discord Rich Presence** once from the source menu in the top-left. After the helper starts, switch back to the Music source (or your preferred source like YouTube Music, Spotify, etc.) and play a track.
+
+![Menu](assets/top-left-menu.png)
 
 1. In MyGo Music, go to **Settings > Plugins** and enable **Discord Rich Presence**.
-2. Click the source dropdown menu in the top-left corner and select **Discord Rich Presence** (or **Discord Status**).
-3. Switch back to your music source and start playing. Your Discord status will update immediately!
+2. Click the source dropdown menu in the top-left corner and select **Discord Rich Presence**.
+3. Switch back to your music source and start playing. Your Discord status will updated.
 
 ## Features
 
