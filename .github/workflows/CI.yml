@@ -14,13 +14,12 @@ on:
       - docs/**
   pull_request: null
 
-env:
-  NODE_VERSION: 24
-
 jobs:
   release:
     name: Release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     if: github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v4
@@ -28,7 +27,7 @@ jobs:
       - name: Zip root directory
         run: |
           VERSION=$(git log -1 --pretty=%B)
-          zip -r "discord-mygo-music.zip" . -x "AGENTS.md"
+          zip -r "discord-mygo-music.zip" . -x "AGENTS.md" -x ".git/*"
 
       - name: Create Release
         id: create_release
@@ -40,7 +39,6 @@ jobs:
               --notes "Release version $VERSION" \
               --target ${{ github.sha }} \
               "discord-mygo-music.zip"
-          fi
           else
             echo "Skipping release creation for non-version tag: $VERSION"
           fi
