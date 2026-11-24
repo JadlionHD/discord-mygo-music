@@ -27,7 +27,7 @@
     {
       "key": "discordClientId",
       "label": "Discord Application ID",
-      "help": "Application ID from Discord Developer Portal (Default: 631447533323026432)."
+      "help": "(Optional) Application ID from Discord Developer Portal"
     }
   ],
   "navigation": [
