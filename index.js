@@ -56,23 +56,70 @@ function getNativeConfig() {
   };
 }
 
-// Resolve candidate script paths for current platform
-function resolveScriptCandidates(scriptName) {
+let cachedBaseDir = null;
+
+// Dynamically query user app data / home directory without hardcoding any username
+async function queryBaseDir(cfg) {
+  if (cachedBaseDir) return cachedBaseDir;
+  try {
+    const platform = (typeof host !== "undefined" && host.platform) ? host.platform : "windows";
+    let cmd = cfg.cmd;
+    let args = [];
+
+    if (platform === "windows") {
+      args = ["-NoProfile", "-Command", "[Console]::WriteLine($env:APPDATA)"];
+    } else if (platform === "darwin") {
+      args = ["-e", 'import Foundation; print(FileManager.default.homeDirectoryForCurrentUser.path + "/Library/Application Support")'];
+    } else {
+      args = ["-c", "import os; print(os.environ.get('XDG_CONFIG_HOME', os.path.expanduser('~/.config')))\""];
+    }
+
+    const proc = host.spawn(cmd, args);
+    proc.closeStdin();
+    const line = await proc.readLine();
+    while ((await proc.readLine()) !== null) {}
+    await proc.wait();
+    if (line && line.trim()) {
+      cachedBaseDir = line.trim();
+      return cachedBaseDir;
+    }
+  } catch (err) {
+    addLog(`Base directory query notice: ${err.message}`);
+  }
+  return "";
+}
+
+// Resolve candidate script paths for current platform dynamically
+async function resolveScriptCandidates(cfg) {
   const platform = (typeof host !== "undefined" && host.platform) ? host.platform : "windows";
+  const scriptName = cfg.scriptName;
   const candidates = [];
 
+  const baseDir = await queryBaseDir(cfg);
+  if (baseDir) {
+    if (platform === "windows") {
+      candidates.push(
+        `${baseDir}\\MyGo Music\\plugins\\discord-mygo-music-dev\\${scriptName}`,
+        `${baseDir}\\MyGo Music\\plugins\\discord-mygo-music\\${scriptName}`
+      );
+    } else if (platform === "darwin") {
+      candidates.push(
+        `${baseDir}/MyGo Music/plugins/discord-mygo-music-dev/${scriptName}`,
+        `${baseDir}/MyGo Music/plugins/discord-mygo-music/${scriptName}`
+      );
+    } else {
+      candidates.push(
+        `${baseDir}/MyGo Music/plugins/discord-mygo-music-dev/${scriptName}`,
+        `${baseDir}/MyGo Music/plugins/discord-mygo-music/${scriptName}`
+      );
+    }
+  }
+
+  // Relative candidate fallbacks
   if (platform === "windows") {
     candidates.push(
-      `C:\\Users\\Jadlion\\AppData\\Roaming\\MyGo Music\\plugins\\discord-mygo-music-dev\\${scriptName}`,
-      `C:\\Users\\Jadlion\\AppData\\Roaming\\MyGo Music\\plugins\\discord-mygo-music\\${scriptName}`,
       `plugins\\discord-mygo-music-dev\\${scriptName}`,
       `plugins\\discord-mygo-music\\${scriptName}`,
-      scriptName
-    );
-  } else if (platform === "darwin") {
-    candidates.push(
-      `plugins/discord-mygo-music-dev/${scriptName}`,
-      `plugins/discord-mygo-music/${scriptName}`,
       scriptName
     );
   } else {
@@ -92,7 +139,7 @@ async function ensureBridge(force = false) {
   addLog("Ensuring Native Discord RPC Bridge is active...");
   const cfg = getNativeConfig();
   const clientId = (host.setting && host.setting("discordClientId")) ? host.setting("discordClientId") : DEFAULT_CLIENT_ID;
-  const scriptCandidates = resolveScriptCandidates(cfg.scriptName);
+  const scriptCandidates = await resolveScriptCandidates(cfg);
 
   for (const scriptPath of scriptCandidates) {
     try {
