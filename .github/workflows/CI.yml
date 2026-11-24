@@ -27,7 +27,7 @@ jobs:
       - name: Zip root directory
         run: |
           VERSION=$(git log -1 --pretty=%B)
-          zip -r "discord-mygo-music.zip" . -x "AGENTS.md" -x ".git/*"
+          zip -r "discord-mygo-music.zip" . -x "AGENTS.md" -x ".git/*" -x ".github/*"
 
       - name: Create Release
         id: create_release
