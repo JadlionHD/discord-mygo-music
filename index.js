@@ -30,8 +30,8 @@ function getNativeConfig() {
       makeArgs: (scriptPath, clientId) => [
         "-ExecutionPolicy", "Bypass",
         "-NoProfile",
-        "-File", scriptPath,
-        clientId
+        "-Command",
+        `& { $p = '${scriptPath}'; if (-not (Test-Path $p)) { $p = Join-Path $env:APPDATA 'MyGo Music\\plugins\\discord-mygo-music-dev\\bridge-windows.ps1' }; if (-not (Test-Path $p)) { $p = Join-Path $env:APPDATA 'MyGo Music\\plugins\\discord-mygo-music\\bridge-windows.ps1' }; if (-not (Test-Path $p)) { $p = 'bridge-windows.ps1' }; & $p '${clientId}' }`
       ]
     };
   }

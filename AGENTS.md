@@ -37,7 +37,7 @@ discord-mygo-music/
 ## 3. Platform Implementations
 
 ### Windows (`bridge-windows.ps1`)
-- **Runtime**: Windows PowerShell 5.1+ (`powershell.exe -ExecutionPolicy Bypass -NoProfile -File ...`).
+- **Runtime**: Windows PowerShell 5.1+ (`powershell.exe -ExecutionPolicy Bypass -NoProfile -Command ...`).
 - **Discord IPC**: Connects via `System.IO.Pipes.NamedPipeClientStream` to `\\.\pipe\discord-ipc-*` (probes 0–9).
 - **Non-blocking Pipe Check**: P/Invokes `kernel32.dll` `PeekNamedPipe` to check available bytes before reading, preventing thread hangs.
 - **Media Tracking**: Queries WinRT GSMTC (`Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager`) for 0ms media state detection.
