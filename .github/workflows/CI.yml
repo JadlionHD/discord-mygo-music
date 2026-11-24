@@ -25,12 +25,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: root
-          path: .
-
       - name: Zip root directory
         run: |
           VERSION=$(git log -1 --pretty=%B)
