@@ -1,0 +1,15 @@
+{
+  "Discord Rich Presence": "Discord Rich Presence",
+  "Discord Application ID": "ID Aplikasi Discord",
+  "Application ID from Discord Developer Portal (Default: 631447533323026432).": "ID Aplikasi dari Discord Developer Portal (Bawaan: 631447533323026432).",
+  "Discord Status": "Status Discord",
+  "Debugger": "Debugger",
+  "Discord Debugger": "Debugger Discord",
+  "Sync Status": "Status Sinkronisasi",
+  "Bridge Status": "Status Bridge",
+  "Runtime Priority": "Prioritas Runtime",
+  "Active via": "Aktif via",
+  "Waiting for runtime (Node.js, Bun, or Deno not detected)": "Menunggu runtime (Node.js, Bun, atau Deno belum terdeteksi)",
+  "Discord Client ID": "ID Klien Discord",
+  "no such page": "Halaman tidak ditemukan"
+}

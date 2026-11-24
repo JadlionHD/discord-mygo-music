@@ -1,0 +1,46 @@
+{
+  "id": "discord-mygo-music",
+  "name": "Discord Rich Presence",
+  "version": "1.0.0",
+  "minAppVersion": "0.1.8",
+  "main": "index.js",
+  "playback": "stream",
+  "permissions": {
+    "network": [
+      "raw.githubusercontent.com",
+      "music.163.com"
+    ],
+    "process": [
+      "powershell.exe",
+      "powershell",
+      "python3",
+      "/usr/bin/python3",
+      "/usr/local/bin/python3",
+      "/opt/homebrew/bin/python3",
+      "playerctl",
+      "/usr/bin/playerctl",
+      "swift",
+      "/usr/bin/swift",
+      "nowplaying-cli",
+      "/usr/local/bin/nowplaying-cli",
+      "/opt/homebrew/bin/nowplaying-cli"
+    ]
+  },
+  "settings": [
+    {
+      "key": "discordClientId",
+      "label": "Discord Application ID",
+      "help": "Application ID from Discord Developer Portal (Default: 631447533323026432)."
+    }
+  ],
+  "navigation": [
+    {
+      "builtin": "home"
+    },
+    {
+      "title": "Debugger",
+      "page": "debugger",
+      "icon": "chart"
+    }
+  ]
+}

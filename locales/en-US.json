@@ -1,0 +1,15 @@
+{
+  "Discord Rich Presence": "Discord Rich Presence",
+  "Discord Application ID": "Discord Application ID",
+  "Application ID from Discord Developer Portal (Default: 631447533323026432).": "Application ID from Discord Developer Portal (Default: 631447533323026432).",
+  "Discord Status": "Discord Status",
+  "Debugger": "Debugger",
+  "Discord Debugger": "Discord Debugger",
+  "Sync Status": "Sync Status",
+  "Bridge Status": "Bridge Status",
+  "Runtime Priority": "Runtime Priority",
+  "Active via": "Active via",
+  "Waiting for runtime (Node.js, Bun, or Deno not detected)": "Waiting for runtime (Node.js, Bun, or Deno not detected)",
+  "Discord Client ID": "Discord Client ID",
+  "no such page": "No such page"
+}
