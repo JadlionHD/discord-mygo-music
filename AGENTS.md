@@ -100,9 +100,9 @@ Every Discord IPC message consists of an **8-byte header** followed by a **UTF-8
    - Always present: `https://music.egoist.dev/`.
 
 ### Album Art Resolution & Fallback
-1. Prefer `details.album.imageUrl` from `session.json`.
-2. If missing or null, execute an anonymous query to NetEase Cloud Music API (`https://music.163.com/api/cloudsearch/pc?s={title}+{artist}&type=1&limit=3&offset=0`) to retrieve HD album art.
-3. If search fails, fallback to default icon (`https://raw.githubusercontent.com/egoist/mygo-music/main/resources/icon.png`).
+1. Prefer `details.album.imageUrl` from `session.json` or track metadata.
+2. If missing, null, or local `file:///` path, fallback immediately to default icon (`https://raw.githubusercontent.com/egoist/mygo-music/main/resources/icon.png`) with zero blocking network delay.
+3. When `session.json` writes the active track details, the multi-stage retry queue automatically picks up the official HD cover art and updates Discord presence.
 4. **Cache Key Requirement**: `$coverUrl` **must** be part of `$lastActivityKey`. When a cover resolves from default to HD, the changed key forces an immediate Discord update.
 
 ### Multi-Stage Retry Queue

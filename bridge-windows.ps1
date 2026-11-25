@@ -36,7 +36,6 @@ if ($env:DISCORD_RPC_DEBUG -eq "1" -or ($PSBoundParameters -and $PSBoundParamete
 
 $DEFAULT_ICON = "https://raw.githubusercontent.com/egoist/mygo-music/main/resources/icon.png"
 $DOWNLOAD_URL = "https://music.egoist.dev/"
-$script:coverCache = @{}
 $script:debugTickCount = 0
 
 function Write-Log([string]$msg) {
@@ -193,48 +192,6 @@ function Clean-Title([string]$str) {
   if (-not $str) { return "" }
   $cleaned = $str.ToLower() -replace '\s*[\(\[](feat\.?|ft\.?|official|video|mv|audio|remix|lyrics?|full version).*?[\)\]]', ''
   return ($cleaned -replace '[^\p{L}\p{N}]', '')
-}
-
-function Search-Cover([string]$title, [string]$artist) {
-  if (-not $title) { return $null }
-  $cacheKey = "$title|$artist"
-  if ($script:coverCache.ContainsKey($cacheKey)) {
-    return $script:coverCache[$cacheKey]
-  }
-
-  try {
-    $query = [System.Uri]::EscapeDataString("$title $artist".Trim())
-    $url = "https://music.163.com/api/cloudsearch/pc?s=$query&type=1&limit=3&offset=0"
-    Write-DebugLog "Querying NetEase HD cover fallback: $url"
-    $req = [System.Net.WebRequest]::Create($url)
-    $req.Timeout = 2500
-    $req.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
-    $req.Referer = "https://music.163.com/"
-    
-    $resp = $req.GetResponse()
-    $stream = $resp.GetResponseStream()
-    $reader = [System.IO.StreamReader]::new($stream, [System.Text.Encoding]::UTF8)
-    $json = $reader.ReadToEnd() | ConvertFrom-Json
-    $reader.Dispose()
-    $stream.Dispose()
-    $resp.Dispose()
-
-    if ($json -and $json.result -and $json.result.songs -and $json.result.songs.Count -gt 0) {
-      $song = $json.result.songs[0]
-      $pic = if ($song.al -and $song.al.picUrl) { $song.al.picUrl } elseif ($song.album -and $song.album.picUrl) { $song.album.picUrl } else { $null }
-      if ($pic) {
-        $pic = $pic -replace '^http://', 'https://'
-        $script:coverCache[$cacheKey] = $pic
-        Write-DebugLog "Resolved NetEase HD cover: $pic"
-        return $pic
-      }
-    }
-  } catch {
-    Write-DebugLog "NetEase cover search failed: $($_.Exception.Message)"
-  }
-
-  $script:coverCache[$cacheKey] = $null
-  return $null
 }
 
 function Resolve-TrackDetails([string]$title, [string]$artist, [bool]$forceReload = $false) {
@@ -677,12 +634,8 @@ function Update-Activity($track) {
     Write-DebugLog "Filtered out local/non-HTTP cover URL: $rawCover"
   }
 
-  if (-not $coverUrl) {
-    Write-DebugLog "Querying NetEase cover search fallback for `"$($track.Title)`" by `"$($track.Artist)`"..."
-    $coverUrl = Search-Cover $track.Title $track.Artist
-  }
   if (-not $coverUrl -or -not ($coverUrl -match '^https?://')) {
-    Write-DebugLog "Falling back to default icon for cover art"
+    Write-DebugLog "Using default icon for cover art"
     $coverUrl = $DEFAULT_ICON
   }
 

@@ -14,7 +14,6 @@ import struct
 import subprocess
 import re
 import signal
-import urllib.request
 import urllib.parse
 
 DEFAULT_CLIENT_ID = "631447533323026432"
@@ -29,7 +28,6 @@ non_flag_args = [a for a in sys.argv[1:] if not a.startswith("-")]
 CLIENT_ID = non_flag_args[0] if len(non_flag_args) > 0 else os.environ.get("DISCORD_CLIENT_ID", DEFAULT_CLIENT_ID)
 DEFAULT_ICON = "https://raw.githubusercontent.com/egoist/mygo-music/main/resources/icon.png"
 DOWNLOAD_URL = "https://music.egoist.dev/"
-cover_cache = {}
 
 def log(msg):
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -123,38 +121,6 @@ def clean_title(text):
         return ""
     cleaned = re.sub(r"\s*[\(\[](feat\.?|ft\.?|official|video|mv|audio|remix|lyrics?|full version).*?[\)\]]", "", text, flags=re.IGNORECASE)
     return re.sub(r"[^\w]", "", cleaned.lower())
-
-def search_cover(title, artist):
-    if not title:
-        return None
-    cache_key = f"{title}|{artist}"
-    if cache_key in cover_cache:
-        return cover_cache[cache_key]
-
-    try:
-        query = urllib.parse.quote(f"{title} {artist}".strip())
-        url = f"https://music.163.com/api/cloudsearch/pc?s={query}&type=1&limit=3&offset=0"
-        debug_log(f"Querying NetEase HD cover fallback: {url}")
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-            "Referer": "https://music.163.com/",
-        })
-        with urllib.request.urlopen(req, timeout=2.5) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            songs = data.get("result", {}).get("songs", [])
-            if songs and len(songs) > 0:
-                song = songs[0]
-                pic = (song.get("al") or song.get("album") or {}).get("picUrl")
-                if pic:
-                    pic = re.sub(r"^http://", "https://", pic)
-                    cover_cache[cache_key] = pic
-                    debug_log(f"Resolved NetEase HD cover: {pic}")
-                    return pic
-    except Exception as e:
-        debug_log(f"NetEase cover search failed: {e}")
-
-    cover_cache[cache_key] = None
-    return None
 
 def resolve_track_details(title, artist, force_reload=False):
     sess = get_session_data(force_reload)
@@ -606,11 +572,8 @@ def update_activity(track):
     elif raw_cover:
         debug_log(f"Filtered out local/non-HTTP cover URL: {raw_cover}")
 
-    if not cover_url:
-        debug_log(f"Querying NetEase cover search fallback for \"{track.get('title')}\" by \"{track.get('artist')}\"...")
-        cover_url = search_cover(track.get("title"), track.get("artist"))
     if not cover_url or not re.match(r"^https?://", cover_url):
-        debug_log("Falling back to default icon for cover art")
+        debug_log("Using default icon for cover art")
         cover_url = DEFAULT_ICON
 
     # Schedule multi-stage background retry if online details, direct track URL, or real cover not found immediately

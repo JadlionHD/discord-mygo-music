@@ -16,7 +16,6 @@ let nonFlagArgs = CommandLine.arguments.dropFirst().filter { !$0.hasPrefix("-") 
 let clientId = nonFlagArgs.first ?? (ProcessInfo.processInfo.environment["DISCORD_CLIENT_ID"] ?? defaultClientId)
 let defaultIcon = "https://raw.githubusercontent.com/egoist/mygo-music/main/resources/icon.png"
 let downloadUrl = "https://music.egoist.dev/"
-var coverCache: [String: String] = [:]
 
 func logMessage(_ msg: String) {
     let formatter = ISO8601DateFormatter()
@@ -86,53 +85,6 @@ func synthesizeTrackUrl(source: String?, trackId: String?, title: String?, artis
         if let id = trackId, !id.isEmpty { return "https://www.bilibili.com/video/\(id)" }
         if !q.isEmpty { return "https://search.bilibili.com/all?keyword=\(q)" }
     }
-    return nil
-}
-
-func searchCover(title: String, artist: String) -> String? {
-    let key = "\(title)|\(artist)"
-    if let cached = coverCache[key] { return cached }
-
-    guard let query = "\(title) \(artist)".addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-          let url = URL(string: "https://music.163.com/api/cloudsearch/pc?s=\(query)&type=1&limit=3&offset=0") else {
-        return nil
-    }
-
-    debugLog("Querying NetEase HD cover fallback: \(url.absoluteString)")
-
-    var request = URLRequest(url: url)
-    request.timeoutInterval = 2.5
-    request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120 Safari/537.36", forHTTPHeaderField: "User-Agent")
-    request.setValue("https://music.163.com/", forHTTPHeaderField: "Referer")
-
-    let semaphore = DispatchSemaphore(value: 0)
-    var foundPic: String?
-
-    let task = URLSession.shared.dataTask(with: request) { data, _, _ in
-        defer { semaphore.signal() }
-        guard let data = data,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let result = json["result"] as? [String: Any],
-              let songs = result["songs"] as? [[String: Any]],
-              let first = songs.first else { return }
-
-        let album = (first["al"] as? [String: Any]) ?? (first["album"] as? [String: Any])
-        if var pic = album?["picUrl"] as? String {
-            if pic.hasPrefix("http://") {
-                pic = "https://" + pic.dropFirst(7)
-            }
-            foundPic = pic
-        }
-    }
-    task.resume()
-    _ = semaphore.wait(timeout: .now() + 2.5)
-
-    if let pic = foundPic {
-        coverCache[key] = pic
-        debugLog("Resolved NetEase HD cover: \(pic)")
-        return pic
-    }
-    coverCache[key] = nil
     return nil
 }
 
@@ -381,12 +333,8 @@ func dispatchTrack(_ cur: [String: Any], sess: [String: Any]) {
         debugLog("Filtered out local/non-HTTP cover URL: \(raw)")
     }
 
-    if coverUrl == nil || coverUrl!.isEmpty {
-        debugLog("Querying NetEase cover search fallback for \"\(name)\" by \"\(artistStr)\"...")
-        coverUrl = searchCover(title: name, artist: artistStr)
-    }
     if coverUrl == nil || coverUrl!.isEmpty || (!coverUrl!.hasPrefix("http://") && !coverUrl!.hasPrefix("https://")) {
-        debugLog("Falling back to default icon for cover art")
+        debugLog("Using default icon for cover art")
         coverUrl = defaultIcon
     }
 
