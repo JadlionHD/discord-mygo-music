@@ -1,12 +1,12 @@
 {
   "id": "discord-mygo-music",
   "name": "Discord Rich Presence",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "minAppVersion": "0.1.8",
   "main": "index.js",
   "playback": "stream",
   "permissions": {
-    "network": ["raw.githubusercontent.com", "music.163.com"],
+    "network": ["music.163.com"],
     "process": [
       "powershell.exe",
       "powershell",
@@ -28,11 +28,6 @@
       "key": "discordClientId",
       "label": "Discord Application ID",
       "help": "(Optional) Application ID from Discord Developer Portal"
-    },
-    {
-      "key": "debugMode",
-      "label": "Debug Mode",
-      "help": "Enable detailed verbose logging (-debug flag) for troubleshooting Discord presence"
     }
   ],
   "navigation": [
