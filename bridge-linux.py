@@ -71,6 +71,30 @@ session_path = os.path.join(config_dir, "MyGo Music", "session.json")
 cached_session = None
 last_session_mtime = 0
 
+settings_path = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")) + "/MyGo Music/settings.json"
+cached_active_source = None
+last_settings_mtime = 0
+
+def get_active_source(force_reload=False):
+    global cached_active_source, last_settings_mtime
+    if not os.path.exists(settings_path):
+        return None
+    try:
+        mtime = os.path.getmtime(settings_path)
+        if not force_reload and cached_active_source and mtime == last_settings_mtime:
+            return cached_active_source
+        with open(settings_path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+            if content:
+                data = json.loads(content)
+                if data and data.get("source"):
+                    cached_active_source = data["source"]
+                    last_settings_mtime = mtime
+                    return cached_active_source
+    except Exception as e:
+        debug_log(f"Error reading settings.json: {e}")
+    return cached_active_source
+
 def get_session_data(force_reload=False):
     global cached_session, last_session_mtime
     if not os.path.exists(session_path):
@@ -137,23 +161,38 @@ def resolve_track_details(title, artist, force_reload=False):
     if not sess or not isinstance(sess.get("queue"), list) or len(sess["queue"]) == 0:
         return None
 
+    active_source = get_active_source(force_reload)
+
     n_title = normalize_text(title)
     n_artist = normalize_text(artist)
     c_title = clean_title(title)
 
-    # 1. Check current queue pointer
-    idx = sess.get("at", 0) if isinstance(sess.get("at"), int) else 0
-    if sess.get("shuffle") and isinstance(sess.get("order"), list) and len(sess["order"]) > idx:
-        idx = sess["order"][idx]
-
+    # 1. Check current queue pointer and surrounding indices first (+/- 2 items)
+    raw_at = sess.get("at", 0) if isinstance(sess.get("at"), int) else 0
+    check_indices = [raw_at, raw_at + 1, raw_at - 1, raw_at + 2, raw_at - 2]
     queue = sess["queue"]
-    if idx < len(queue):
-        cur = queue[idx]
-        if cur and cur.get("name"):
-            cur_n_title = normalize_text(cur["name"])
-            cur_c_title = clean_title(cur["name"])
-            if cur_n_title == n_title or (c_title and cur_c_title == c_title):
-                return cur
+
+    for test_at in check_indices:
+        if test_at < 0:
+            continue
+        idx = test_at
+        if sess.get("shuffle") and isinstance(sess.get("order"), list) and len(sess["order"]) > idx:
+            idx = sess["order"][idx]
+        if idx < len(queue):
+            cur = queue[idx]
+            if cur and cur.get("name"):
+                cur_n_title = normalize_text(cur["name"])
+                cur_c_title = clean_title(cur["name"])
+                cur_artists = " ".join([a.get("name", "") for a in cur.get("artists", [])]) if isinstance(cur.get("artists"), list) else ""
+                cur_n_artist = normalize_text(cur_artists)
+
+                title_match = (cur_n_title == n_title) or (c_title and cur_c_title == c_title) or \
+                              (n_title and n_title in cur_n_title) or (cur_n_title and cur_n_title in n_title)
+                artist_match = (not n_artist) or (not cur_n_artist) or (n_artist in cur_n_artist) or (cur_n_artist in n_artist)
+
+                if title_match and artist_match:
+                    if not active_source or not cur.get("source") or cur.get("source") == active_source or cur_n_title == n_title:
+                        return cur
 
     # 2. Score candidate matches
     best = None
@@ -165,25 +204,55 @@ def resolve_track_details(title, artist, force_reload=False):
         tn_artist = normalize_text(t_artists)
         tc_title = clean_title(t_name)
 
-        score = 0
-        artist_matches = (not n_artist) or (n_artist in tn_artist) or (tn_artist in n_artist)
+        has_both_artists = len(n_artist) >= 2 and len(tn_artist) >= 2
+        artist_match = (n_artist in tn_artist or tn_artist in n_artist) if has_both_artists else True
 
-        if tn_title == n_title and artist_matches:
-            score = 100
-        elif c_title and tc_title == c_title and artist_matches:
-            score = 90
-        elif tn_title == n_title:
-            score = 80
-        elif c_title and tc_title == c_title:
-            score = 75
-        elif c_title and (c_title in tc_title or tc_title in c_title) and artist_matches:
-            score = 60
+        if has_both_artists and not artist_match:
+            continue
+
+        source_matches = (not active_source) or (not t.get("source")) or (t.get("source") == active_source)
+
+        score = 0
+        if tn_title == n_title and artist_match:
+            score = 100 if source_matches else 70
+        elif c_title and tc_title == c_title and artist_match:
+            score = 90 if source_matches else 65
+        elif c_title and (c_title in tc_title or tc_title in c_title) and artist_match:
+            score = 80 if source_matches else 55
+        elif tn_title == n_title and not has_both_artists:
+            score = 70 if source_matches else 50
 
         if score > best_score:
             best_score = score
             best = t
 
-    return best if best_score >= 60 else None
+    return best if best_score >= 65 else None
+
+def synthesize_track_url(source, track_id, title, artist):
+    s = (source or "").lower().strip()
+    q = urllib.parse.quote(f"{title or ''} {artist or ''}".strip())
+
+    if s in ["youtube-music", "ytmusic", "youtube"]:
+        if track_id:
+            return f"https://music.youtube.com/watch?v={track_id}"
+        if q:
+            return f"https://music.youtube.com/search?q={q}"
+    elif s in ["spotify", "mygotify"]:
+        if track_id:
+            return f"https://open.spotify.com/track/{track_id}"
+        if q:
+            return f"https://open.spotify.com/search/{q}"
+    elif "netease" in s or s in ["163", "cloudmusic"]:
+        if track_id:
+            return f"https://music.163.com/#/song?id={track_id}"
+        if q:
+            return f"https://music.163.com/#/search/m/?s={q}&type=1"
+    elif s == "bilibili":
+        if track_id:
+            return f"https://www.bilibili.com/video/{track_id}"
+        if q:
+            return f"https://search.bilibili.com/all?keyword={q}"
+    return None
 
 def format_source_label(source, url):
     s = (source or "").lower().strip()
@@ -198,27 +267,52 @@ def format_source_label(source, url):
     if "localhost" in lu or "127.0.0.1" in lu or "::1" in lu:
         return None
 
-    if "music.youtube.com" in lu or s in ["youtube-music", "ytmusic"]:
+    # 1. URL domain authority
+    if "music.youtube.com" in lu:
         return "YouTube Music"
-    if "youtube.com" in lu or "youtu.be" in lu or s == "youtube":
+    if "youtube.com" in lu or "youtu.be" in lu:
         return "YouTube"
-    if "spotify.com" in lu or s in ["spotify", "mygotify"]:
+    if "spotify.com" in lu:
         return "Spotify"
-    if "163.com" in lu or "netease" in s or s in ["163", "cloudmusic"]:
+    if "163.com" in lu or "music.126.net" in lu:
         return "NetEase"
-    if "bilibili.com" in lu or s == "bilibili":
+    if "bilibili.com" in lu:
         return "Bilibili"
-    if "soundcloud.com" in lu or s == "soundcloud":
+    if "soundcloud.com" in lu:
         return "SoundCloud"
-    if "music.apple.com" in lu or s in ["apple", "applemusic"]:
+    if "music.apple.com" in lu:
         return "Apple Music"
-    if "bandcamp.com" in lu or s == "bandcamp":
+    if "bandcamp.com" in lu:
         return "Bandcamp"
-    if "deezer.com" in lu or s == "deezer":
+    if "deezer.com" in lu:
         return "Deezer"
-    if "tidal.com" in lu or s == "tidal":
+    if "tidal.com" in lu:
         return "Tidal"
-    if "qq.com" in lu or "qqmusic" in s or s == "qq":
+    if "qq.com" in lu:
+        return "QQ Music"
+
+    # 2. Source parameter fallback
+    if s in ["youtube-music", "ytmusic"]:
+        return "YouTube Music"
+    if s == "youtube":
+        return "YouTube"
+    if s in ["spotify", "mygotify"]:
+        return "Spotify"
+    if "netease" in s or s in ["163", "cloudmusic"]:
+        return "NetEase"
+    if s == "bilibili":
+        return "Bilibili"
+    if s == "soundcloud":
+        return "SoundCloud"
+    if s in ["apple", "applemusic"]:
+        return "Apple Music"
+    if s == "bandcamp":
+        return "Bandcamp"
+    if s == "deezer":
+        return "Deezer"
+    if s == "tidal":
+        return "Tidal"
+    if "qqmusic" in s or s == "qq":
         return "QQ Music"
 
     if source and s not in ["web", "stream", "unknown", "http", "https", "mpris", "mediaremote"] and "mygo" not in s:
@@ -422,7 +516,7 @@ missing_count = 0
 active_track_key = ""
 active_start_time = 0
 current_track = None
-retry_delays = [0.15, 0.45, 1.0, 2.0]
+retry_delays = [0.2, 0.5, 1.0, 2.0, 4.0, 8.0]
 retry_attempt = 0
 pending_retry_time = 0
 last_track_obj = None
@@ -472,12 +566,14 @@ def update_activity(track):
     elif is_paused:
         active_track_key = track_key
 
-    # Cross-reference with session.json
-    details = resolve_track_details(track.get("title"), track.get("artist"))
+    # Cross-reference with session.json and active settings source
+    details = resolve_track_details(track.get("title"), track.get("artist"), False)
+    active_source = get_active_source(False)
+
     if details:
         debug_log(f"Matched session queue item: \"{details.get('name')}\" (Source: {details.get('source')})")
     else:
-        debug_log(f"No session.json queue match for \"{track.get('title')}\" by \"{track.get('artist')}\"")
+        debug_log(f"No session.json queue match for \"{track.get('title')}\" by \"{track.get('artist')}\" (Active source: {active_source})")
 
     if dur_sec == 0 and details and details.get("duration", 0) > 0:
         dur_sec = int(details["duration"] / 1000)
@@ -488,21 +584,17 @@ def update_activity(track):
 
     song_url = track.get("url") or (details.get("url") if details else None)
     song_source = details.get("source") if details else None
-    if not song_source and track.get("source") and "mygo" not in track.get("source", "").lower():
+    if not song_source and active_source:
+        song_source = active_source
+    elif not song_source and track.get("source") and "mygo" not in track.get("source", "").lower():
         song_source = track["source"]
 
-    # Synthesize URL if missing
-    if not song_url and details and details.get("id"):
-        s = (song_source or "").lower()
-        t_id = details["id"]
-        if s in ["youtube-music", "ytmusic", "youtube"]:
-            song_url = f"https://music.youtube.com/watch?v={t_id}"
-        elif s in ["spotify", "mygotify"]:
-            song_url = f"https://open.spotify.com/track/{t_id}"
-        elif "netease" in s or s in ["163", "cloudmusic"]:
-            song_url = f"https://music.163.com/#/song?id={t_id}"
-        elif s == "bilibili":
-            song_url = f"https://www.bilibili.com/video/{t_id}"
+    # Synthesize URL if missing using details.id or search query
+    if not song_url and song_source:
+        song_id = details.get("id") if details else None
+        song_url = synthesize_track_url(song_source, song_id, track.get("title"), track.get("artist"))
+        if song_url:
+            debug_log(f"Synthesized {song_source} URL: {song_url}")
 
     source_label = format_source_label(song_source, song_url)
 
@@ -521,8 +613,9 @@ def update_activity(track):
         debug_log("Falling back to default icon for cover art")
         cover_url = DEFAULT_ICON
 
-    # Schedule background retry if details or cover not resolved yet
-    if not is_paused and (not details or not song_url or cover_url == DEFAULT_ICON):
+    # Schedule multi-stage background retry if online details, direct track URL, or real cover not found immediately
+    has_direct_url = bool(song_url and re.search(r"watch\?v=|/track/|/song\?id=|/video/", song_url))
+    if not details or not has_direct_url or cover_url == DEFAULT_ICON:
         if retry_attempt < len(retry_delays):
             pending_retry_time = time.time() + retry_delays[retry_attempt]
             last_track_obj = track

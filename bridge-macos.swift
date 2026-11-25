@@ -45,9 +45,20 @@ if let oldPidStr = try? String(contentsOfFile: pidFile, encoding: .utf8),
 }
 try? "\(getpid())".write(toFile: pidFile, atomically: true, encoding: .utf8)
 
-// Session path
+// Session & Settings path
 let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
 let sessionPath = "\(homeDir)/Library/Application Support/MyGo Music/session.json"
+let settingsPath = "\(homeDir)/Library/Application Support/MyGo Music/settings.json"
+
+func getActiveSource() -> String? {
+    guard FileManager.default.fileExists(atPath: settingsPath),
+          let data = try? Data(contentsOf: URL(fileURLWithPath: settingsPath)),
+          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let source = json["source"] as? String else {
+        return nil
+    }
+    return source
+}
 
 func getSessionData() -> [String: Any]? {
     guard FileManager.default.fileExists(atPath: sessionPath),
@@ -56,6 +67,26 @@ func getSessionData() -> [String: Any]? {
         return nil
     }
     return json
+}
+
+func synthesizeTrackUrl(source: String?, trackId: String?, title: String?, artist: String?) -> String? {
+    let s = (source ?? "").lowercased().trimmingCharacters(in: .whitespaces)
+    let q = "\(title ?? "") \(artist ?? "")".trimmingCharacters(in: .whitespaces).addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+
+    if s == "youtube-music" || s == "ytmusic" || s == "youtube" {
+        if let id = trackId, !id.isEmpty { return "https://music.youtube.com/watch?v=\(id)" }
+        if !q.isEmpty { return "https://music.youtube.com/search?q=\(q)" }
+    } else if s == "spotify" || s == "mygotify" {
+        if let id = trackId, !id.isEmpty { return "https://open.spotify.com/track/\(id)" }
+        if !q.isEmpty { return "https://open.spotify.com/search/\(q)" }
+    } else if s.contains("netease") || s == "163" || s == "cloudmusic" {
+        if let id = trackId, !id.isEmpty { return "https://music.163.com/#/song?id=\(id)" }
+        if !q.isEmpty { return "https://music.163.com/#/search/m/?s=\(q)&type=1" }
+    } else if s == "bilibili" {
+        if let id = trackId, !id.isEmpty { return "https://www.bilibili.com/video/\(id)" }
+        if !q.isEmpty { return "https://search.bilibili.com/all?keyword=\(q)" }
+    }
+    return nil
 }
 
 func searchCover(title: String, artist: String) -> String? {
@@ -116,17 +147,31 @@ func formatSourceLabel(source: String?, url: String?) -> String? {
     let lu = u.lowercased()
     if lu.contains("localhost") || lu.contains("127.0.0.1") || lu.contains("::1") { return nil }
 
-    if lu.contains("music.youtube.com") || s == "youtube-music" || s == "ytmusic" { return "YouTube Music" }
-    if lu.contains("youtube.com") || lu.contains("youtu.be") || s == "youtube" { return "YouTube" }
-    if lu.contains("spotify.com") || s == "spotify" || s == "mygotify" { return "Spotify" }
-    if lu.contains("163.com") || s.contains("netease") || s == "163" || s == "cloudmusic" { return "NetEase" }
-    if lu.contains("bilibili.com") || s == "bilibili" { return "Bilibili" }
-    if lu.contains("soundcloud.com") || s == "soundcloud" { return "SoundCloud" }
-    if lu.contains("music.apple.com") || s == "apple" || s == "applemusic" { return "Apple Music" }
-    if lu.contains("bandcamp.com") || s == "bandcamp" { return "Bandcamp" }
-    if lu.contains("deezer.com") || s == "deezer" { return "Deezer" }
-    if lu.contains("tidal.com") || s == "tidal" { return "Tidal" }
-    if lu.contains("qq.com") || s.contains("qqmusic") || s == "qq" { return "QQ Music" }
+    // 1. URL domain authority
+    if lu.contains("music.youtube.com") { return "YouTube Music" }
+    if lu.contains("youtube.com") || lu.contains("youtu.be") { return "YouTube" }
+    if lu.contains("spotify.com") { return "Spotify" }
+    if lu.contains("163.com") || lu.contains("music.126.net") { return "NetEase" }
+    if lu.contains("bilibili.com") { return "Bilibili" }
+    if lu.contains("soundcloud.com") { return "SoundCloud" }
+    if lu.contains("music.apple.com") { return "Apple Music" }
+    if lu.contains("bandcamp.com") { return "Bandcamp" }
+    if lu.contains("deezer.com") { return "Deezer" }
+    if lu.contains("tidal.com") { return "Tidal" }
+    if lu.contains("qq.com") { return "QQ Music" }
+
+    // 2. Source parameter fallback
+    if s == "youtube-music" || s == "ytmusic" { return "YouTube Music" }
+    if s == "youtube" { return "YouTube" }
+    if s == "spotify" || s == "mygotify" { return "Spotify" }
+    if s.contains("netease") || s == "163" || s == "cloudmusic" { return "NetEase" }
+    if s == "bilibili" { return "Bilibili" }
+    if s == "soundcloud" { return "SoundCloud" }
+    if s == "apple" || s == "applemusic" { return "Apple Music" }
+    if s == "bandcamp" { return "Bandcamp" }
+    if s == "deezer" { return "Deezer" }
+    if s == "tidal" { return "Tidal" }
+    if s.contains("qqmusic") || s == "qq" { return "QQ Music" }
 
     if let src = source, !["web", "stream", "unknown", "http", "https", "mpris", "mediaremote"].contains(s), !s.contains("mygo") {
         let clean = src.replacingOccurrences(of: "[-_]+", with: " ", options: .regularExpression).capitalized
@@ -310,23 +355,22 @@ func dispatchTrack(_ cur: [String: Any], sess: [String: Any]) {
     let nowSec = Int64(Date().timeIntervalSince1970)
     let startSec = nowSec - posSec
 
+    let activeSource = getActiveSource()
     var songUrl = cur["url"] as? String
-    let source = cur["source"] as? String ?? "MyGo Music"
+    var songSource = cur["source"] as? String
+    if songSource == nil || songSource!.isEmpty {
+        songSource = activeSource ?? "MyGo Music"
+    }
 
-    if (songUrl == nil || songUrl!.isEmpty), let id = cur["id"] as? String {
-        let s = source.lowercased()
-        if s == "youtube-music" || s == "ytmusic" || s == "youtube" {
-            songUrl = "https://music.youtube.com/watch?v=\(id)"
-        } else if s == "spotify" || s == "mygotify" {
-            songUrl = "https://open.spotify.com/track/\(id)"
-        } else if s.contains("netease") || s == "163" || s == "cloudmusic" {
-            songUrl = "https://music.163.com/#/song?id=\(id)"
-        } else if s == "bilibili" {
-            songUrl = "https://www.bilibili.com/video/\(id)"
+    let trackId = cur["id"] as? String
+    if (songUrl == nil || songUrl!.isEmpty), let src = songSource {
+        songUrl = synthesizeTrackUrl(source: src, trackId: trackId, title: name, artist: artistStr)
+        if let su = songUrl {
+            debugLog("Synthesized \(src) URL: \(su)")
         }
     }
 
-    let sourceLabel = formatSourceLabel(source: source, url: songUrl)
+    let sourceLabel = formatSourceLabel(source: songSource, url: songUrl)
 
     // Artwork resolution: discard non-http (file:///) URLs
     let rawCover = (cur["album"] as? [String: Any])?["imageUrl"] as? String

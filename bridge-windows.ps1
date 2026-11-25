@@ -36,7 +36,7 @@ if ($env:DISCORD_RPC_DEBUG -eq "1" -or ($PSBoundParameters -and $PSBoundParamete
 
 $DEFAULT_ICON = "https://raw.githubusercontent.com/egoist/mygo-music/main/resources/icon.png"
 $DOWNLOAD_URL = "https://music.egoist.dev/"
-$coverCache = @{}
+$script:coverCache = @{}
 $script:debugTickCount = 0
 
 function Write-Log([string]$msg) {
@@ -118,8 +118,43 @@ try {
 # 4. Session & Track Helpers (Non-locking FileShare)
 # -------------------------------------------------------------
 $sessionPath = Join-Path $env:APPDATA "MyGo Music\session.json"
+$settingsPath = Join-Path $env:APPDATA "MyGo Music\settings.json"
 $script:cachedSession = $null
 $script:lastSessionMtime = 0
+$script:cachedActiveSource = $null
+$script:lastSettingsMtime = 0
+
+function Get-ActiveSource([bool]$forceReload = $false) {
+  if (-not (Test-Path $settingsPath)) { return $null }
+  try {
+    $item = Get-Item $settingsPath -ErrorAction SilentlyContinue
+    if (-not $item) { return $script:cachedActiveSource }
+    $mtime = $item.LastWriteTimeUtc.Ticks
+    if (-not $forceReload -and $script:cachedActiveSource -and $mtime -eq $script:lastSettingsMtime) {
+      return $script:cachedActiveSource
+    }
+
+    $fs = [System.IO.FileStream]::new($settingsPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    $sr = [System.IO.StreamReader]::new($fs, [System.Text.Encoding]::UTF8)
+    $raw = $sr.ReadToEnd()
+    $sr.Dispose()
+    $fs.Dispose()
+
+    if (-not [string]::IsNullOrWhiteSpace($raw)) {
+      $parsed = $raw | ConvertFrom-Json
+      if ($parsed -is [array] -and $parsed.Count -gt 0) { $parsed = $parsed[0] }
+      if ($parsed -and $parsed.source) {
+        $srcVal = if ($parsed.source -is [array]) { $parsed.source[0] } else { $parsed.source }
+        $script:cachedActiveSource = [string]$srcVal
+        $script:lastSettingsMtime = $mtime
+        return $script:cachedActiveSource
+      }
+    }
+  } catch {
+    Write-DebugLog "Error reading settings.json: $($_.Exception.Message)"
+  }
+  return $script:cachedActiveSource
+}
 
 function Get-SessionData([bool]$forceReload = $false) {
   if (-not (Test-Path $sessionPath)) { return $null }
@@ -138,6 +173,7 @@ function Get-SessionData([bool]$forceReload = $false) {
 
     if (-not [string]::IsNullOrWhiteSpace($raw)) {
       $parsed = $raw | ConvertFrom-Json
+      if ($parsed -is [array] -and $parsed.Count -gt 0) { $parsed = $parsed[0] }
       $script:cachedSession = $parsed
       $script:lastSessionMtime = $mtime
       return $parsed
@@ -205,22 +241,50 @@ function Resolve-TrackDetails([string]$title, [string]$artist, [bool]$forceReloa
   $sess = Get-SessionData $forceReload
   if (-not $sess -or -not $sess.queue -or $sess.queue.Count -eq 0) { return $null }
 
+  $activeSource = Get-ActiveSource $forceReload
+
   $nTitle = Normalize-Text $title
   $nArtist = Normalize-Text $artist
   $cTitle = Clean-Title $title
 
-  # 1. Check current queue pointer first
-  $idx = if ($sess.at -ne $null) { [int]$sess.at } else { 0 }
-  if ($sess.shuffle -and $sess.order -and $sess.order.Count -gt $idx) {
-    $idx = [int]$sess.order[$idx]
+  # 1. Check current queue pointer and surrounding indices first (+/- 2 items)
+  if ($sess -is [array] -and $sess.Count -gt 0) { $sess = $sess[0] }
+  $rawAt = 0
+  if ($sess.at -ne $null) {
+    try {
+      $firstAt = if ($sess.at -is [array]) { $sess.at[0] } else { $sess.at }
+      $rawAt = [int]$firstAt
+    } catch {
+      $rawAt = 0
+    }
   }
-  if ($idx -lt $sess.queue.Count) {
-    $cur = $sess.queue[$idx]
-    if ($cur -and $cur.name) {
-      $curNTitle = Normalize-Text $cur.name
-      $curCTitle = Clean-Title $cur.name
-      if ($curNTitle -eq $nTitle -or ($cTitle -and $curCTitle -eq $cTitle)) {
-        return $cur
+  [int]$baseAt = [int]$rawAt
+  $checkIndices = @($baseAt, ($baseAt + 1), ($baseAt - 1), ($baseAt + 2), ($baseAt - 2))
+
+  foreach ($testAt in $checkIndices) {
+    if ($testAt -lt 0) { continue }
+    $idx = $testAt
+    if ($sess.shuffle -and $sess.order -and $sess.order.Count -gt $idx) {
+      $idx = [int]$sess.order[$idx]
+    }
+    if ($idx -lt $sess.queue.Count) {
+      $cur = $sess.queue[$idx]
+      if ($cur -and $cur.name) {
+        $curNTitle = Normalize-Text $cur.name
+        $curCTitle = Clean-Title $cur.name
+        $curArtists = if ($cur.artists) { ($cur.artists | ForEach-Object { $_.name }) -join " " } else { "" }
+        $curNArtist = Normalize-Text $curArtists
+
+        $titleMatch = ($curNTitle -eq $nTitle) -or ($cTitle -and $curCTitle -eq $cTitle) -or
+                      ($nTitle -and $curNTitle.Contains($nTitle)) -or ($curNTitle -and $nTitle.Contains($curNTitle))
+        $artistMatch = (-not $nArtist -or -not $curNArtist -or $curNArtist.Contains($nArtist) -or $nArtist.Contains($curNArtist))
+
+        if ($titleMatch -and $artistMatch) {
+          # If active source is known, prefer track with matching source or exact title
+          if (-not $activeSource -or -not $cur.source -or $cur.source -eq $activeSource -or $curNTitle -eq $nTitle) {
+            return $cur
+          }
+        }
       }
     }
   }
@@ -236,19 +300,31 @@ function Resolve-TrackDetails([string]$title, [string]$artist, [bool]$forceReloa
     $tnArtist = Normalize-Text $tArtists
     $tcTitle = Clean-Title $t.name
 
+    # Artist compatibility: if both exist, they must share tokens or substrings
+    $hasBothArtists = ($nArtist.Length -ge 2 -and $tnArtist.Length -ge 2)
+    $artistMatch = if ($hasBothArtists) {
+      $tnArtist.Contains($nArtist) -or $nArtist.Contains($tnArtist)
+    } else {
+      $true
+    }
+
+    # Reject immediately if both tracks have an artist and they don't match
+    if ($hasBothArtists -and -not $artistMatch) {
+      continue
+    }
+
+    # Source compatibility check: prefer matching active source
+    $sourceMatches = (-not $activeSource -or -not $t.source -or $t.source -eq $activeSource)
+
     $score = 0
-    if ($tnTitle -eq $nTitle -and (-not $nArtist -or $tnArtist.Contains($nArtist) -or $nArtist.Contains($tnArtist))) {
-      $score = 100
-    } elseif ($cTitle -and $tcTitle -eq $cTitle -and (-not $nArtist -or $tnArtist.Contains($nArtist) -or $nArtist.Contains($tnArtist))) {
-      $score = 90
-    } elseif ($tnTitle -eq $nTitle) {
-      $score = 80
-    } elseif ($cTitle -and $tcTitle -eq $cTitle) {
-      $score = 75
-    } elseif ($cTitle -and ($tcTitle.Contains($cTitle) -or $cTitle.Contains($tcTitle))) {
-      if ($nArtist -and ($tnArtist.Contains($nArtist) -or $nArtist.Contains($tnArtist))) {
-        $score = 60
-      }
+    if ($tnTitle -eq $nTitle -and $artistMatch) {
+      $score = if ($sourceMatches) { 100 } else { 70 }
+    } elseif ($cTitle -and $tcTitle -eq $cTitle -and $artistMatch) {
+      $score = if ($sourceMatches) { 90 } else { 65 }
+    } elseif ($cTitle -and ($tcTitle.Contains($cTitle) -or $cTitle.Contains($tcTitle)) -and $artistMatch) {
+      $score = if ($sourceMatches) { 80 } else { 55 }
+    } elseif ($tnTitle -eq $nTitle -and -not $hasBothArtists) {
+      $score = if ($sourceMatches) { 70 } else { 50 }
     }
 
     if ($score -gt $bestScore) {
@@ -257,7 +333,27 @@ function Resolve-TrackDetails([string]$title, [string]$artist, [bool]$forceReloa
     }
   }
 
-  if ($bestScore -ge 60) { return $best }
+  if ($bestScore -ge 65) { return $best }
+  return $null
+}
+
+function Synthesize-TrackUrl([string]$source, [string]$id, [string]$title, [string]$artist) {
+  $s = ($source + "").ToLower().Trim()
+  $q = [System.Uri]::EscapeDataString(("$title $artist").Trim())
+
+  if ($s -in @("youtube-music", "ytmusic", "youtube")) {
+    if ($id) { return "https://music.youtube.com/watch?v=$id" }
+    if ($q) { return "https://music.youtube.com/search?q=$q" }
+  } elseif ($s -in @("spotify", "mygotify")) {
+    if ($id) { return "https://open.spotify.com/track/$id" }
+    if ($q) { return "https://open.spotify.com/search/$q" }
+  } elseif ($s.Contains("netease") -or $s -in @("163", "cloudmusic")) {
+    if ($id) { return "https://music.163.com/#/song?id=$id" }
+    if ($q) { return "https://music.163.com/#/search/m/?s=$q&type=1" }
+  } elseif ($s -eq "bilibili") {
+    if ($id) { return "https://www.bilibili.com/video/$id" }
+    if ($q) { return "https://search.bilibili.com/all?keyword=$q" }
+  }
   return $null
 }
 
@@ -278,37 +374,73 @@ function Format-SourceLabel([string]$source, [string]$url) {
     return $null
   }
 
-  if ($lu.Contains("music.youtube.com") -or $s -in @("youtube-music", "ytmusic")) {
+  # 1. URL domain is the highest authority
+  if ($lu.Contains("music.youtube.com")) {
     return "YouTube Music"
   }
-  if ($lu.Contains("youtube.com") -or $lu.Contains("youtu.be") -or $s -eq "youtube") {
+  if ($lu.Contains("youtube.com") -or $lu.Contains("youtu.be")) {
     return "YouTube"
   }
-  if ($lu.Contains("spotify.com") -or $s -in @("spotify", "mygotify")) {
+  if ($lu.Contains("spotify.com")) {
     return "Spotify"
   }
-  if ($lu.Contains("163.com") -or $s.Contains("netease") -or $s -in @("163", "cloudmusic")) {
+  if ($lu.Contains("163.com") -or $lu.Contains("music.126.net")) {
     return "NetEase"
   }
-  if ($lu.Contains("bilibili.com") -or $s -eq "bilibili") {
+  if ($lu.Contains("bilibili.com")) {
     return "Bilibili"
   }
-  if ($lu.Contains("soundcloud.com") -or $s -eq "soundcloud") {
+  if ($lu.Contains("soundcloud.com")) {
     return "SoundCloud"
   }
-  if ($lu.Contains("music.apple.com") -or $s -in @("apple", "applemusic")) {
+  if ($lu.Contains("music.apple.com")) {
     return "Apple Music"
   }
-  if ($lu.Contains("bandcamp.com") -or $s -eq "bandcamp") {
+  if ($lu.Contains("bandcamp.com")) {
     return "Bandcamp"
   }
-  if ($lu.Contains("deezer.com") -or $s -eq "deezer") {
+  if ($lu.Contains("deezer.com")) {
     return "Deezer"
   }
-  if ($lu.Contains("tidal.com") -or $s -eq "tidal") {
+  if ($lu.Contains("tidal.com")) {
     return "Tidal"
   }
-  if ($lu.Contains("qq.com") -or $s.Contains("qqmusic") -or $s -eq "qq") {
+  if ($lu.Contains("qq.com")) {
+    return "QQ Music"
+  }
+
+  # 2. Source parameter fallback
+  if ($s -in @("youtube-music", "ytmusic")) {
+    return "YouTube Music"
+  }
+  if ($s -eq "youtube") {
+    return "YouTube"
+  }
+  if ($s -in @("spotify", "mygotify")) {
+    return "Spotify"
+  }
+  if ($s.Contains("netease") -or $s -in @("163", "cloudmusic")) {
+    return "NetEase"
+  }
+  if ($s -eq "bilibili") {
+    return "Bilibili"
+  }
+  if ($s -eq "soundcloud") {
+    return "SoundCloud"
+  }
+  if ($s -in @("apple", "applemusic")) {
+    return "Apple Music"
+  }
+  if ($s -eq "bandcamp") {
+    return "Bandcamp"
+  }
+  if ($s -eq "deezer") {
+    return "Deezer"
+  }
+  if ($s -eq "tidal") {
+    return "Tidal"
+  }
+  if ($s.Contains("qqmusic") -or $s -eq "qq") {
     return "QQ Music"
   }
 
@@ -330,7 +462,7 @@ $script:lastActivityKey = ""
 $script:activeTrackKey = ""
 $script:activeStartTime = 0
 $script:currentTrack = $null
-$script:retryDelays = @(150, 450, 1000, 2000)
+$script:retryDelays = @(200, 500, 1000, 2000, 4000, 8000)
 $script:retryAttempt = 0
 $script:pendingRetryTime = 0
 $script:lastTrackObj = $null
@@ -497,12 +629,14 @@ function Update-Activity($track) {
     $script:activeTrackKey = $trackKey
   }
 
-  # Cross-reference with session.json
-  $details = Resolve-TrackDetails $track.Title $track.Artist
+  # Cross-reference with session.json and active settings source
+  $details = Resolve-TrackDetails $track.Title $track.Artist $false
+  $activeSource = Get-ActiveSource $false
+
   if ($details) {
     Write-DebugLog "Matched session queue item: `"$($details.name)`" (Source: $($details.source))"
   } else {
-    Write-DebugLog "No session.json queue match for `"$($track.Title)`" by `"$($track.Artist)`""
+    Write-DebugLog "No session.json queue match for `"$($track.Title)`" by `"$($track.Artist)`" (Active source: $activeSource)"
   }
 
   if ($durSec -eq 0 -and $details -and $details.duration -gt 0) {
@@ -512,19 +646,22 @@ function Update-Activity($track) {
   $endSec = if ($track.EndTime -gt $startSec) { [long]$track.EndTime } elseif ($durSec -gt 0 -and $startSec -gt 0) { [long]($startSec + $durSec) } else { 0 }
 
   $songUrl = if ($track.Url) { $track.Url } elseif ($details -and $details.url) { $details.url } else { $null }
-  $songSource = if ($details -and $details.source) { $details.source } elseif ($track.Source -and -not ($track.Source -match '(?i)mygo|egoist|windows')) { $track.Source } else { $null }
+  $songSource = if ($details -and $details.source) {
+    $details.source
+  } elseif ($activeSource) {
+    $activeSource
+  } elseif ($track.Source -and -not ($track.Source -match '(?i)mygo|egoist|windows')) {
+    $track.Source
+  } else {
+    $null
+  }
 
-  # URL synthesis if missing
-  if (-not $songUrl -and $details -and $details.id) {
-    $s = ($songSource + "").ToLower()
-    if ($s -in @("youtube-music", "ytmusic", "youtube")) {
-      $songUrl = "https://music.youtube.com/watch?v=$($details.id)"
-    } elseif ($s -in @("spotify", "mygotify")) {
-      $songUrl = "https://open.spotify.com/track/$($details.id)"
-    } elseif ($s.Contains("netease") -or $s -in @("163", "cloudmusic")) {
-      $songUrl = "https://music.163.com/#/song?id=$($details.id)"
-    } elseif ($s -eq "bilibili") {
-      $songUrl = "https://www.bilibili.com/video/$($details.id)"
+  # If songUrl is missing, synthesize using details.id OR title/artist search fallback
+  if (-not $songUrl -and $songSource) {
+    $songId = if ($details -and $details.id) { $details.id } else { $null }
+    $songUrl = Synthesize-TrackUrl $songSource $songId $track.Title $track.Artist
+    if ($songUrl) {
+      Write-DebugLog "Synthesized $songSource URL: $songUrl"
     }
   }
 
@@ -549,8 +686,9 @@ function Update-Activity($track) {
     $coverUrl = $DEFAULT_ICON
   }
 
-  # Schedule multi-stage background retry if online details or real cover not found immediately
-  if (-not $isPaused -and (-not $details -or -not $songUrl -or $coverUrl -eq $DEFAULT_ICON)) {
+  # Schedule multi-stage background retry if online details, direct track URL, or real cover not found immediately
+  $hasDirectUrl = ($songUrl -and ($songUrl -match 'watch\?v=|/track/|/song\?id=|\/video\/'))
+  if (-not $details -or -not $hasDirectUrl -or $coverUrl -eq $DEFAULT_ICON) {
     if ($script:retryAttempt -lt $script:retryDelays.Count) {
       $delay = $script:retryDelays[$script:retryAttempt]
       $script:pendingRetryTime = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + $delay
