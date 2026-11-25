@@ -3,23 +3,55 @@
 # Uses: Windows PowerShell 5.1+, .NET NamedPipeClientStream, and WinRT GSMTC.
 
 param(
-  [string]$ClientId = "631447533323026432"
+  [Parameter(Position = 0)]
+  [string]$ClientId = "631447533323026432",
+  [Parameter(Position = 1)]
+  [string]$Flag = ""
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
+$DebugPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
+
+# Determine if debug mode is active via parameters, environment, or args
+$script:isDebug = $false
+if ($ClientId -match '(?i)^[/-]{1,2}(debug|d)$') {
+  $script:isDebug = $true
+  $ClientId = "631447533323026432"
+}
+if ($Flag -match '(?i)^[/-]{1,2}(debug|d)$') {
+  $script:isDebug = $true
+}
+foreach ($a in $args) {
+  if ($a -match '(?i)^[/-]{1,2}(debug|d)$') {
+    $script:isDebug = $true
+  } elseif ($a -match '^\d{17,20}$') {
+    $ClientId = $a
+  }
+}
+if ($env:DISCORD_RPC_DEBUG -eq "1" -or ($PSBoundParameters -and $PSBoundParameters.ContainsKey('Debug'))) {
+  $script:isDebug = $true
+}
 
 $DEFAULT_ICON = "https://raw.githubusercontent.com/egoist/mygo-music/main/resources/icon.png"
 $DOWNLOAD_URL = "https://music.egoist.dev/"
 $coverCache = @{}
+$script:debugTickCount = 0
 
 function Write-Log([string]$msg) {
   $ts = [DateTime]::UtcNow.ToString("o")
   [Console]::WriteLine("[$ts] [discord-mygo-music-native] $msg")
 }
 
-Write-Log "Starting Windows Native Discord RPC Bridge (Client ID: $ClientId)"
+function Write-DebugLog([string]$msg) {
+  if ($script:isDebug) {
+    $ts = [DateTime]::UtcNow.ToString("o")
+    [Console]::WriteLine("[$ts] [discord-mygo-music-debug] $msg")
+  }
+}
+
+Write-Log "Starting Windows Native Discord RPC Bridge (Client ID: $ClientId, Debug: $(if ($script:isDebug) {'ENABLED'} else {'DISABLED'}))"
 
 # -------------------------------------------------------------
 # 1. Single Instance Protection (via PID file in %TEMP%)
@@ -77,6 +109,7 @@ function Await-Op($op, $t) {
 $gsmtcMgr = $null
 try {
   $gsmtcMgr = Await-Op ($managerType.GetMethod('RequestAsync').Invoke($null, @())) $managerType
+  Write-DebugLog "Initialized WinRT GSMTC session manager"
 } catch {
   Write-Log "Warning: Could not initialize WinRT GSMTC session manager: $($_.Exception.Message)"
 }
@@ -97,7 +130,6 @@ function Get-SessionData([bool]$forceReload = $false) {
       return $script:cachedSession
     }
 
-    # Open with FileShare.ReadWrite to prevent locking conflicts when MyGo Music writes
     $fs = [System.IO.FileStream]::new($sessionPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
     $sr = [System.IO.StreamReader]::new($fs, [System.Text.Encoding]::UTF8)
     $raw = $sr.ReadToEnd()
@@ -110,7 +142,9 @@ function Get-SessionData([bool]$forceReload = $false) {
       $script:lastSessionMtime = $mtime
       return $parsed
     }
-  } catch {}
+  } catch {
+    Write-DebugLog "Error reading session.json: $($_.Exception.Message)"
+  }
   return $script:cachedSession
 }
 
@@ -135,6 +169,7 @@ function Search-Cover([string]$title, [string]$artist) {
   try {
     $query = [System.Uri]::EscapeDataString("$title $artist".Trim())
     $url = "https://music.163.com/api/cloudsearch/pc?s=$query&type=1&limit=3&offset=0"
+    Write-DebugLog "Querying NetEase HD cover fallback: $url"
     $req = [System.Net.WebRequest]::Create($url)
     $req.Timeout = 2500
     $req.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
@@ -154,10 +189,13 @@ function Search-Cover([string]$title, [string]$artist) {
       if ($pic) {
         $pic = $pic -replace '^http://', 'https://'
         $script:coverCache[$cacheKey] = $pic
+        Write-DebugLog "Resolved NetEase HD cover: $pic"
         return $pic
       }
     }
-  } catch {}
+  } catch {
+    Write-DebugLog "NetEase cover search failed: $($_.Exception.Message)"
+  }
 
   $script:coverCache[$cacheKey] = $null
   return $null
@@ -314,6 +352,9 @@ function Send-DiscordFrame([int]$opcode, $obj) {
   if (-not $script:pipe -or -not $script:pipe.IsConnected) { return $false }
   try {
     $json = $obj | ConvertTo-Json -Compress -Depth 10
+    if ($opcode -eq 1 -and $obj.cmd -eq "SET_ACTIVITY") {
+      Write-DebugLog "Sending SET_ACTIVITY frame: $json"
+    }
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
     $writer = New-Object System.IO.BinaryWriter($script:pipe)
     $writer.Write([int32]$opcode)
@@ -332,6 +373,7 @@ function Handshake-Discord {
     v = 1
     client_id = $ClientId
   }
+  Write-DebugLog "Dispatching Discord IPC Handshake (Opcode 0, Client ID: $ClientId)"
   return (Send-DiscordFrame 0 $payload)
 }
 
@@ -369,11 +411,22 @@ function Check-IncomingPipe {
           $script:lastActivityKey = ""
           # Immediately dispatch current active track upon handshake
           if ($script:currentTrack) {
+            Write-DebugLog "Handshake finished, immediately updating queued track"
             Update-Activity $script:currentTrack
           }
+        } elseif ($respJson.Contains('"evt":"ERROR"') -or $respJson.Contains('"evt": "ERROR"')) {
+          try {
+            $errObj = $respJson | ConvertFrom-Json
+            Write-Log "DISCORD RPC ERROR: Code $($errObj.data.code) - $($errObj.data.message)"
+          } catch {
+            Write-Log "DISCORD RPC ERROR: $respJson"
+          }
+        } else {
+          Write-DebugLog "Discord Frame (Opcode 1): $respJson"
         }
       } elseif ($opcode -eq 3) {
         # PING -> PONG
+        Write-DebugLog "Received PING, replying PONG"
         Send-DiscordFrame 4 ($respJson | ConvertFrom-Json)
       } elseif ($opcode -eq 2) {
         Write-Log "Discord closed connection."
@@ -395,7 +448,7 @@ function Update-Activity($track) {
   $script:currentTrack = $track
 
   if (-not $script:isHandshaked) {
-    # Store track and wait until Discord READY handshake arrives
+    Write-DebugLog "Handshake not complete yet; cached track `"$($track.Title)`""
     return
   }
 
@@ -446,6 +499,12 @@ function Update-Activity($track) {
 
   # Cross-reference with session.json
   $details = Resolve-TrackDetails $track.Title $track.Artist
+  if ($details) {
+    Write-DebugLog "Matched session queue item: `"$($details.name)`" (Source: $($details.source))"
+  } else {
+    Write-DebugLog "No session.json queue match for `"$($track.Title)`" by `"$($track.Artist)`""
+  }
+
   if ($durSec -eq 0 -and $details -and $details.duration -gt 0) {
     $durSec = [long][Math]::Floor($details.duration / 1000)
   }
@@ -472,11 +531,21 @@ function Update-Activity($track) {
   $sourceLabel = Format-SourceLabel $songSource $songUrl
 
   # Artwork resolution with online fallback search
-  $coverUrl = if ($track.ImageUrl) { $track.ImageUrl } elseif ($details -and $details.album -and $details.album.imageUrl) { $details.album.imageUrl } else { $null }
+  # Discord ONLY accepts http:// or https:// URLs. Discard local file:/// paths.
+  $rawCover = if ($track.ImageUrl) { $track.ImageUrl } elseif ($details -and $details.album -and $details.album.imageUrl) { $details.album.imageUrl } else { $null }
+  $coverUrl = $null
+  if ($rawCover -and ($rawCover -match '^https?://')) {
+    $coverUrl = $rawCover
+  } elseif ($rawCover) {
+    Write-DebugLog "Filtered out local/non-HTTP cover URL: $rawCover"
+  }
+
   if (-not $coverUrl) {
+    Write-DebugLog "Querying NetEase cover search fallback for `"$($track.Title)`" by `"$($track.Artist)`"..."
     $coverUrl = Search-Cover $track.Title $track.Artist
   }
-  if (-not $coverUrl) {
+  if (-not $coverUrl -or -not ($coverUrl -match '^https?://')) {
+    Write-DebugLog "Falling back to default icon for cover art"
     $coverUrl = $DEFAULT_ICON
   }
 
@@ -486,6 +555,7 @@ function Update-Activity($track) {
       $delay = $script:retryDelays[$script:retryAttempt]
       $script:pendingRetryTime = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + $delay
       $script:lastTrackObj = $track
+      Write-DebugLog "Scheduled retry stage $($script:retryAttempt + 1) in ${delay}ms"
     }
   }
 
@@ -493,19 +563,50 @@ function Update-Activity($track) {
   $key = "$($track.Title)|$($track.Artist)|$($track.Album)|$($track.Status)|$([string]$isPaused)|$startSec|$sourceLabel|$songUrl|$coverUrl"
   if ($key -eq $script:lastActivityKey) { return }
 
-  $headerName = if ($track.Artist) { "$($track.Artist) - $($track.Title)" } else { $track.Title }
+  # Discord RPC Payload Sanitization (Strict Schema Compliance)
+  # details: length 2-128 chars
+  $titleStr = [string]$track.Title
+  if ($titleStr.Length -lt 2) {
+    $titleStr = "$titleStr "
+  }
+  if ($titleStr.Length -gt 128) {
+    $titleStr = $titleStr.Substring(0, 125) + "..."
+    Write-DebugLog "Title truncated to 128 characters: $titleStr"
+  }
+
+  # state: length 2-128 chars. Discord REJECTS empty state ("") with Code 4000. Omit if empty.
+  $artistStr = [string]$track.Artist
+  $stateStr = if ($isPaused) {
+    if ($artistStr) { "$artistStr (Paused)" } else { "Paused" }
+  } else {
+    $artistStr
+  }
+
+  $headerName = if ($artistStr) { "$artistStr - $titleStr" } else { $titleStr }
+  if ($headerName.Length -gt 128) { $headerName = $headerName.Substring(0, 125) + "..." }
 
   $activity = @{
     type = 2
     name = $headerName
-    details = $track.Title
-    state = if ($isPaused) { "$($track.Artist) (Paused)" } else { $track.Artist }
-    assets = @{
-      large_image = $coverUrl
-      large_text = if ($track.Album) { $track.Album } else { $track.Title }
-      small_image = $DEFAULT_ICON
-      small_text = if ($isPaused) { "MyGo Music (Paused)" } else { "MyGo Music" }
-    }
+    details = $titleStr
+  }
+
+  if ($stateStr -and $stateStr.Trim().Length -ge 2) {
+    if ($stateStr.Length -gt 128) { $stateStr = $stateStr.Substring(0, 125) + "..." }
+    $activity.state = $stateStr
+  } else {
+    Write-DebugLog "Omitted state property (artist empty or < 2 characters to satisfy Discord validation)"
+  }
+
+  $largeText = if ($track.Album) { [string]$track.Album } else { $titleStr }
+  if ($largeText.Length -gt 128) { $largeText = $largeText.Substring(0, 125) + "..." }
+  if ($largeText.Length -lt 2) { $largeText = "$largeText " }
+
+  $activity.assets = @{
+    large_image = $coverUrl
+    large_text = $largeText
+    small_image = $DEFAULT_ICON
+    small_text = if ($isPaused) { "MyGo Music (Paused)" } else { "MyGo Music" }
   }
 
   if (-not $isPaused -and $startSec -gt 0) {
@@ -516,10 +617,13 @@ function Update-Activity($track) {
     $activity.timestamps = $ts
   }
 
+  # buttons: max 2 buttons, label <= 32 chars, url <= 512 chars (must be http/https)
   $buttons = @()
-  if ($sourceLabel -and $songUrl -and ($songUrl -match '^https?://')) {
+  if ($sourceLabel -and $songUrl -and ($songUrl -match '^https?://') -and $songUrl.Length -le 512) {
+    $bLabel = "Listen on $sourceLabel"
+    if ($bLabel.Length -gt 32) { $bLabel = $bLabel.Substring(0, 32) }
     $buttons += @{
-      label = "Listen on $sourceLabel"
+      label = $bLabel
       url = $songUrl
     }
   }
@@ -546,12 +650,63 @@ function Update-Activity($track) {
     $script:lastActivityKey = $key
     $btnDesc = if ($sourceLabel) { "[$sourceLabel + Download]" } else { "[Download only]" }
     $covDesc = if ($coverUrl -ne $DEFAULT_ICON) { "[Cover: OK]" } else { "[Cover: Default]" }
-    Write-Log "Updated Discord Presence: `"$($track.Title)`" by $($track.Artist) ($($track.Status)) $btnDesc $covDesc"
+    $artDesc = if ($artistStr) { "by $artistStr " } else { "" }
+    Write-Log "Updated Discord Presence: `"$titleStr`" $artDesc(Status: $($track.Status)) $btnDesc $covDesc"
   }
 }
 
 # -------------------------------------------------------------
-# 6. Main Polling Loop
+# 6. Graceful Shutdown & Cleanup Handler
+# -------------------------------------------------------------
+$script:isStopping = $false
+
+function Stop-Bridge {
+  if ($script:isStopping) { return }
+  $script:isStopping = $true
+
+  Write-Log "Shutting down Windows Native Bridge (clearing Discord presence)..."
+  try {
+    if ($script:pipe -and $script:pipe.IsConnected) {
+      $clearFrame = @{
+        cmd = "SET_ACTIVITY"
+        args = @{
+          pid = $PID
+          activity = $null
+        }
+        nonce = [Guid]::NewGuid().ToString()
+      }
+      Send-DiscordFrame 1 $clearFrame | Out-Null
+      Start-Sleep -Milliseconds 60
+      $script:pipe.Flush()
+      $script:pipe.Dispose()
+      $script:pipe = $null
+    }
+  } catch {}
+
+  try {
+    $pidFile = Join-Path $env:TEMP "discord-mygo-music.pid"
+    if (Test-Path $pidFile) {
+      Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+    }
+  } catch {}
+  Write-Log "Bridge shutdown complete."
+}
+
+try {
+  $cancelHandler = [ConsoleCancelEventHandler]{
+    param($sender, $e)
+    Stop-Bridge
+  }
+  [Console]::add_CancelKeyPress($cancelHandler)
+} catch {}
+
+try {
+  $onExit = { Stop-Bridge }
+  $null = Register-EngineEvent -SourceIdentifier ([System.Management.Automation.PsEngineEvent]::Exiting) -Action $onExit -ErrorAction SilentlyContinue
+} catch {}
+
+# -------------------------------------------------------------
+# 7. Main Polling Loop
 # -------------------------------------------------------------
 $lastMetaKey = ""
 $lastStartSec = 0
@@ -560,141 +715,162 @@ $missingCount = 0
 
 Write-Log "Native Windows Bridge active. Polling GSMTC and Discord IPC..."
 
-while ($true) {
-  # 1. Maintain Discord Connection
-  if (-not $script:pipe -or -not $script:pipe.IsConnected) {
-    $script:pipe = Connect-DiscordPipe
-    if ($script:pipe) {
-      Handshake-Discord | Out-Null
+try {
+  while ($true) {
+    # 1. Maintain Discord Connection
+    if (-not $script:pipe -or -not $script:pipe.IsConnected) {
+      $script:pipe = Connect-DiscordPipe
+      if ($script:pipe) {
+        Handshake-Discord | Out-Null
+      }
     }
-  }
 
-  # 2. Check incoming Discord messages
-  Check-IncomingPipe
+    # 2. Check incoming Discord messages
+    Check-IncomingPipe
 
-  # 3. Query WinRT GSMTC for active media
-  $found = $null
-  if ($gsmtcMgr) {
-    try {
-      foreach ($s in $gsmtcMgr.GetSessions()) {
-        $src = [string]$s.SourceAppUserModelId
-        if ($src -match '(?i)mygo|egoist') {
-          $p = $s.GetPlaybackInfo()
-          $props = Await-Op ($s.TryGetMediaPropertiesAsync()) $propsType
-          $tl = $s.GetTimelineProperties()
-
-          $pos = [double]$tl.Position.TotalSeconds
-          $dur = [double]$tl.EndTime.TotalSeconds
-          $currMetaKey = "$($props.Title)|$($props.Artist)|$($props.AlbumTitle)|$($p.PlaybackStatus)"
-          $hasLastUpdated = ($tl.LastUpdatedTime -and $tl.LastUpdatedTime.Year -ge 2020)
-
-          if ($hasLastUpdated) {
-            $startSec = [long]($tl.LastUpdatedTime.ToUnixTimeSeconds() - [Math]::Round($pos))
-          } else {
-            if ($fallbackStartSec -eq 0 -or $currMetaKey -ne $lastMetaKey) {
-              $fallbackStartSec = [long]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [Math]::Round($pos))
-            }
-            $startSec = $fallbackStartSec
-          }
-
-          $found = [PSCustomObject]@{
-            Source    = $src
-            Title     = [string]$props.Title
-            Artist    = [string]$props.Artist
-            Album     = [string]$props.AlbumTitle
-            Status    = [string]$p.PlaybackStatus
-            Position  = $pos
-            Duration  = $dur
-            StartTime = $startSec
-            EndTime   = if ($dur -gt 0) { [long]($startSec + $dur) } else { 0 }
-            Url       = $null
-            ImageUrl  = $null
-          }
-          break
+    # 3. Query WinRT GSMTC for active media
+    $found = $null
+    if ($gsmtcMgr) {
+      try {
+        $sessions = $gsmtcMgr.GetSessions()
+        if ($script:isDebug -and ($script:debugTickCount % 15 -eq 0)) {
+          $activeNames = if ($sessions) { ($sessions | ForEach-Object { $_.SourceAppUserModelId }) -join ", " } else { "None" }
+          Write-DebugLog "WinRT GSMTC tick: $($sessions.Count) active sessions [$activeNames]"
         }
-      }
-    } catch {}
-  }
+        $script:debugTickCount++
 
-  # 4. Fallback: if GSMTC didn't find session, check session.json directly
-  if (-not $found -or -not $found.Title) {
-    $sess = Get-SessionData
-    if ($sess -and $sess.queue -and $sess.queue.Count -gt 0) {
-      $idx = if ($sess.at -ne $null) { [int]$sess.at } else { 0 }
-      if ($sess.shuffle -and $sess.order -and $sess.order.Count -gt $idx) {
-        $idx = [int]$sess.order[$idx]
-      }
-      if ($idx -lt $sess.queue.Count) {
-        $cur = $sess.queue[$idx]
-        if ($cur -and $cur.name) {
-          $artists = if ($cur.artists) { ($cur.artists | ForEach-Object { $_.name }) -join ", " } else { "" }
-          $dur = if ($cur.duration) { [double]($cur.duration / 1000) } else { 0 }
-          $pos = if ($sess.position) { [double]($sess.position / 1000) } else { 0 }
-          $nowSec = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-          $startSec = [long]($nowSec - [Math]::Round($pos))
+        foreach ($s in $sessions) {
+          $src = [string]$s.SourceAppUserModelId
+          if ($src -match '(?i)mygo|egoist') {
+            $p = $s.GetPlaybackInfo()
+            $props = Await-Op ($s.TryGetMediaPropertiesAsync()) $propsType
+            $tl = $s.GetTimelineProperties()
 
-          $item = Get-Item $sessionPath -ErrorAction SilentlyContinue
-          if ($item -and ($item.LastWriteTimeUtc -gt [DateTime]::UtcNow.AddSeconds(-15))) {
+            $pos = [double]$tl.Position.TotalSeconds
+            $dur = [double]$tl.EndTime.TotalSeconds
+            $currMetaKey = "$($props.Title)|$($props.Artist)|$($props.AlbumTitle)|$($p.PlaybackStatus)"
+            $hasLastUpdated = ($tl.LastUpdatedTime -and $tl.LastUpdatedTime.Year -ge 2020)
+
+            if ($hasLastUpdated) {
+              $startSec = [long]($tl.LastUpdatedTime.ToUnixTimeSeconds() - [Math]::Round($pos))
+            } else {
+              if ($fallbackStartSec -eq 0 -or $currMetaKey -ne $lastMetaKey) {
+                $fallbackStartSec = [long]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [Math]::Round($pos))
+              }
+              $startSec = $fallbackStartSec
+            }
+
+            Write-DebugLog "GSMTC matched MyGo: `"$($props.Title)`" by `"$($props.Artist)`" (Status: $($p.PlaybackStatus), Pos: ${pos}s, Dur: ${dur}s)"
+
             $found = [PSCustomObject]@{
-              Source    = if ($cur.source) { $cur.source } else { "MyGo Music" }
-              Title     = [string]$cur.name
-              Artist    = $artists
-              Album     = if ($cur.album) { [string]$cur.album.name } else { "" }
-              Status    = "Playing"
+              Source    = $src
+              Title     = [string]$props.Title
+              Artist    = [string]$props.Artist
+              Album     = [string]$props.AlbumTitle
+              Status    = [string]$p.PlaybackStatus
               Position  = $pos
               Duration  = $dur
               StartTime = $startSec
               EndTime   = if ($dur -gt 0) { [long]($startSec + $dur) } else { 0 }
-              Url       = if ($cur.url) { $cur.url } else { $null }
-              ImageUrl  = if ($cur.album -and $cur.album.imageUrl) { $cur.album.imageUrl } else { $null }
+              Url       = $null
+              ImageUrl  = $null
+            }
+            break
+          }
+        }
+      } catch {
+        Write-DebugLog "GSMTC query error: $($_.Exception.Message)"
+      }
+    }
+
+    # 4. Fallback: if GSMTC didn't find session, check session.json directly
+    if (-not $found -or -not $found.Title) {
+      $sess = Get-SessionData
+      if ($sess -and $sess.queue -and $sess.queue.Count -gt 0) {
+        $idx = if ($sess.at -ne $null) { [int]$sess.at } else { 0 }
+        if ($sess.shuffle -and $sess.order -and $sess.order.Count -gt $idx) {
+          $idx = [int]$sess.order[$idx]
+        }
+        if ($idx -lt $sess.queue.Count) {
+          $cur = $sess.queue[$idx]
+          if ($cur -and $cur.name) {
+            $isMyGoRunning = [bool](Get-Process -Name "MyGo Music" -ErrorAction SilentlyContinue)
+            $item = Get-Item $sessionPath -ErrorAction SilentlyContinue
+            # If MyGo Music is running, accept session.json if updated within 300 seconds
+            $isRecent = $item -and ($item.LastWriteTimeUtc -gt [DateTime]::UtcNow.AddSeconds(-300))
+            if ($isMyGoRunning -and $isRecent) {
+              Write-DebugLog "Active MyGo process detected; using session.json fallback for `"$($cur.name)`""
+              $artists = if ($cur.artists) { ($cur.artists | ForEach-Object { $_.name }) -join ", " } else { "" }
+              $dur = if ($cur.duration) { [double]($cur.duration / 1000) } else { 0 }
+              $pos = if ($sess.position) { [double]($sess.position / 1000) } else { 0 }
+              $nowSec = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+              $startSec = [long]($nowSec - [Math]::Round($pos))
+
+              $found = [PSCustomObject]@{
+                Source    = if ($cur.source) { $cur.source } else { "MyGo Music" }
+                Title     = [string]$cur.name
+                Artist    = $artists
+                Album     = if ($cur.album) { [string]$cur.album.name } else { "" }
+                Status    = "Playing"
+                Position  = $pos
+                Duration  = $dur
+                StartTime = $startSec
+                EndTime   = if ($dur -gt 0) { [long]($startSec + $dur) } else { 0 }
+                Url       = if ($cur.url) { $cur.url } else { $null }
+                ImageUrl  = if ($cur.album -and $cur.album.imageUrl) { $cur.album.imageUrl } else { $null }
+              }
             }
           }
         }
       }
     }
-  }
 
-  # 5. Process media update
-  if ($found -and $found.Title) {
-    $missingCount = 0
-    $metaKey = "$($found.Title)|$($found.Artist)|$($found.Album)|$($found.Status)"
-    $seekChanged = [Math]::Abs($found.StartTime - $lastStartSec) -ge 2
-    $stateChanged = $metaKey -ne $lastMetaKey
+    # 5. Process media update
+    if ($found -and $found.Title) {
+      $missingCount = 0
+      $metaKey = "$($found.Title)|$($found.Artist)|$($found.Album)|$($found.Status)"
+      $seekChanged = [Math]::Abs($found.StartTime - $lastStartSec) -ge 2
+      $stateChanged = $metaKey -ne $lastMetaKey
 
-    if ($stateChanged -or ($found.Status -eq 'Playing' -and $seekChanged)) {
-      $lastMetaKey = $metaKey
-      $lastStartSec = $found.StartTime
-      $script:retryAttempt = 0 # Reset retry attempts for new track
-      Update-Activity $found
-    }
-  } else {
-    $missingCount++
-    if ($missingCount -ge 3 -and $lastMetaKey -ne '__stopped') {
-      $lastMetaKey = '__stopped'
-      $lastStartSec = 0
-      $fallbackStartSec = 0
-      $script:retryAttempt = 0
-      Update-Activity $null
-    }
-  }
-
-  # 6. Check asynchronous retry for enriched session details & album covers
-  if ($script:pendingRetryTime -gt 0 -and [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -ge $script:pendingRetryTime) {
-    $script:pendingRetryTime = 0
-    $script:retryAttempt++
-    if ($script:lastTrackObj -and $lastMetaKey -ne '__stopped') {
-      $freshDetails = Resolve-TrackDetails $script:lastTrackObj.Title $script:lastTrackObj.Artist $true
-      if ($freshDetails) {
-        Write-Log "Enriched track details and artwork from session for `"$($script:lastTrackObj.Title)`""
-        $script:lastActivityKey = "" # Force re-send with newly enriched details/cover
-        Update-Activity $script:lastTrackObj
-      } elseif ($script:retryAttempt -lt $script:retryDelays.Count) {
-        # Reschedule next retry if still not written to disk yet
-        $delay = $script:retryDelays[$script:retryAttempt]
-        $script:pendingRetryTime = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + $delay
+      if ($stateChanged -or ($found.Status -eq 'Playing' -and $seekChanged)) {
+        $lastMetaKey = $metaKey
+        $lastStartSec = $found.StartTime
+        $script:retryAttempt = 0 # Reset retry attempts for new track
+        Update-Activity $found
+      }
+    } else {
+      $missingCount++
+      if ($missingCount -ge 3 -and $lastMetaKey -ne '__stopped') {
+        $lastMetaKey = '__stopped'
+        $lastStartSec = 0
+        $fallbackStartSec = 0
+        $script:retryAttempt = 0
+        Write-DebugLog "No media detected after $missingCount ticks, clearing presence"
+        Update-Activity $null
       }
     }
-  }
 
-  Start-Sleep -Milliseconds 300
+    # 6. Check asynchronous retry for enriched session details & album covers
+    if ($script:pendingRetryTime -gt 0 -and [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -ge $script:pendingRetryTime) {
+      $script:pendingRetryTime = 0
+      $script:retryAttempt++
+      if ($script:lastTrackObj -and $lastMetaKey -ne '__stopped') {
+        $freshDetails = Resolve-TrackDetails $script:lastTrackObj.Title $script:lastTrackObj.Artist $true
+        if ($freshDetails) {
+          Write-Log "Enriched track details and artwork from session for `"$($script:lastTrackObj.Title)`""
+          $script:lastActivityKey = "" # Force re-send with newly enriched details/cover
+          Update-Activity $script:lastTrackObj
+        } elseif ($script:retryAttempt -lt $script:retryDelays.Count) {
+          # Reschedule next retry if still not written to disk yet
+          $delay = $script:retryDelays[$script:retryAttempt]
+          $script:pendingRetryTime = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + $delay
+          Write-DebugLog "Rescheduled retry stage $($script:retryAttempt + 1) in ${delay}ms"
+        }
+      }
+    }
+
+    Start-Sleep -Milliseconds 300
+  }
+} finally {
+  Stop-Bridge
 }

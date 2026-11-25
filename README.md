@@ -33,6 +33,7 @@ Runs out-of-the-box with **zero external dependencies**
 In **Settings > Plugins > Discord Rich Presence**:
 
 - **Discord Application ID**: Customize your Discord Developer Application ID (Default: `631447533323026432`).
+- **Debug Mode**: Enable verbose diagnostic logging in the plugin Debugger tab or via `-debug` CLI flag for troubleshooting presence issues.
 
 ## Documentation & Policies
 

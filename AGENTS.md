@@ -128,3 +128,25 @@ When a track begins playing, GSMTC signals in 0ms, but `session.json` may flush 
 2. **Locales Protection**: Never modify or delete files inside `locales/` (`en.json`, `en-US.json`, `id.json`, `id-ID.json`).
 3. **No External Dependencies**: Never add `npm`, `pip`, or other external package manager dependencies. Standard libraries only.
 4. **Single-Instance Mutex**: All native bridges must maintain a PID lock file (`discord-mygo-music.pid` in `%TEMP%` or `/tmp`) to terminate stale instances on startup.
+
+---
+
+## 8. Debug Mode & Discord RPC Schema Sanitization
+
+### Debug Flag & Diagnostic Trace
+- **Flags**: All bridges accept `-debug`, `--debug`, `-d`, or the environment variable `DISCORD_RPC_DEBUG=1`.
+- **Plugin Setting**: `debugMode` in `plugin.json` passes the `-Debug` / `-debug` flag dynamically when spawned.
+- **Verbose Output**:
+  - Emits `[discord-mygo-music-debug]` logs detailing WinRT GSMTC/MPRIS2 session discovery, `session.json` queue matches, NetEase artwork searches, and raw `SET_ACTIVITY` frames.
+  - Automatically captures and logs Discord RPC errors (`evt: "ERROR"`, Error Code `4000`, etc.).
+
+### Strict Discord RPC Schema Sanitization
+Discord RPC rejects payloads with Code `4000` if constraints are violated. All bridges must enforce:
+1. **`details` (Title)**: Length must be between 2 and 128 characters (padded if length < 2, truncated to 125 + `...` if > 128).
+2. **`state` (Artist)**: Discord **does not allow** an empty string `""`. If the track has no artist or artist is < 2 characters, **omit the `state` key entirely**. If length > 128, truncate to 125 + `...`.
+3. **`assets.large_image`**: Must be a valid `http://` or `https://` URL. Local `file:///` URLs from `session.json` must be filtered out and fallback to NetEase search or default icon.
+4. **`assets.large_text`**: Length between 2 and 128 characters.
+5. **`buttons`**: Maximum 2 buttons. Label length $\le 32$ characters. URL length $\le 512$ characters (must match `^https?://`).
+
+### Graceful Shutdown (Ctrl+C & Process Exit)
+All bridges must register interruption signal handlers (`Console.CancelKeyPress` in PowerShell, `SIGINT`/`SIGTERM` in Python and Swift, and `finally` blocks) to dispatch `SET_ACTIVITY` with `activity: null`, flush and close the pipe connection, and remove the PID file so Discord clears presence instantly on exit.

@@ -18,7 +18,15 @@ import urllib.request
 import urllib.parse
 
 DEFAULT_CLIENT_ID = "631447533323026432"
-CLIENT_ID = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("DISCORD_CLIENT_ID", DEFAULT_CLIENT_ID)
+IS_DEBUG = (
+    "--debug" in sys.argv
+    or "-debug" in sys.argv
+    or "-d" in sys.argv
+    or "-Debug" in sys.argv
+    or os.environ.get("DISCORD_RPC_DEBUG") == "1"
+)
+non_flag_args = [a for a in sys.argv[1:] if not a.startswith("-")]
+CLIENT_ID = non_flag_args[0] if len(non_flag_args) > 0 else os.environ.get("DISCORD_CLIENT_ID", DEFAULT_CLIENT_ID)
 DEFAULT_ICON = "https://raw.githubusercontent.com/egoist/mygo-music/main/resources/icon.png"
 DOWNLOAD_URL = "https://music.egoist.dev/"
 cover_cache = {}
@@ -26,6 +34,11 @@ cover_cache = {}
 def log(msg):
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     print(f"[{ts}] [discord-mygo-music-native-linux] {msg}", flush=True)
+
+def debug_log(msg):
+    if IS_DEBUG:
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        print(f"[{ts}] [discord-mygo-music-debug] {msg}", flush=True)
 
 # -------------------------------------------------------------
 # 1. Single Instance Protection
@@ -46,7 +59,7 @@ try:
 except Exception:
     pass
 
-log(f"Starting Linux Native Discord RPC Bridge (Client ID: {CLIENT_ID})")
+log(f"Starting Linux Native Discord RPC Bridge (Client ID: {CLIENT_ID}, Debug: {'ENABLED' if IS_DEBUG else 'DISABLED'})")
 
 # -------------------------------------------------------------
 # 2. Session & Track Resolution
@@ -72,8 +85,8 @@ def get_session_data(force_reload=False):
                 cached_session = json.loads(content)
                 last_session_mtime = mtime
                 return cached_session
-    except Exception:
-        pass
+    except Exception as e:
+        debug_log(f"Error reading session.json: {e}")
     return cached_session
 
 def normalize_text(text):
@@ -97,6 +110,7 @@ def search_cover(title, artist):
     try:
         query = urllib.parse.quote(f"{title} {artist}".strip())
         url = f"https://music.163.com/api/cloudsearch/pc?s={query}&type=1&limit=3&offset=0"
+        debug_log(f"Querying NetEase HD cover fallback: {url}")
         req = urllib.request.Request(url, headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
             "Referer": "https://music.163.com/",
@@ -110,9 +124,10 @@ def search_cover(title, artist):
                 if pic:
                     pic = re.sub(r"^http://", "https://", pic)
                     cover_cache[cache_key] = pic
+                    debug_log(f"Resolved NetEase HD cover: {pic}")
                     return pic
-    except Exception:
-        pass
+    except Exception as e:
+        debug_log(f"NetEase cover search failed: {e}")
 
     cover_cache[cache_key] = None
     return None
@@ -261,6 +276,8 @@ class DiscordIPC:
             return False
         try:
             body = json.dumps(payload, separators=(',', ':')).encode("utf-8")
+            if opcode == 1 and payload.get("cmd") == "SET_ACTIVITY":
+                debug_log(f"Sending SET_ACTIVITY frame: {body.decode('utf-8')}")
             header = struct.pack("<ii", opcode, len(body))
             self.sock.sendall(header + body)
             return True
@@ -270,6 +287,7 @@ class DiscordIPC:
             return False
 
     def handshake(self):
+        debug_log(f"Dispatching Discord IPC Handshake (Opcode 0, Client ID: {self.client_id})")
         self.send_frame(0, {"v": 1, "client_id": self.client_id})
 
     def check_incoming(self):
@@ -290,12 +308,19 @@ class DiscordIPC:
 
                 try:
                     msg = json.loads(body.decode("utf-8"))
-                    if opcode == 1 and msg.get("evt") == "READY":
-                        log("Discord RPC Ready!")
-                        self.handshaked = True
-                        if callable(self.on_ready):
-                            self.on_ready()
+                    if opcode == 1:
+                        if msg.get("evt") == "READY":
+                            log("Discord RPC Ready!")
+                            self.handshaked = True
+                            if callable(self.on_ready):
+                                self.on_ready()
+                        elif msg.get("evt") == "ERROR":
+                            err_data = msg.get("data", {})
+                            log(f"DISCORD RPC ERROR: Code {err_data.get('code')} - {err_data.get('message')}")
+                        else:
+                            debug_log(f"Discord Frame (Opcode 1): {msg}")
                     elif opcode == 3:
+                        debug_log("Received PING, replying PONG")
                         self.send_frame(4, msg)
                     elif opcode == 2:
                         log("Discord closed connection")
@@ -339,6 +364,7 @@ def query_playerctl():
                         dur = float(len_str) / 1000000.0 if len_str.isdigit() else 0.0
                         now_sec = int(time.time())
                         start_sec = now_sec - int(round(pos))
+                        debug_log(f"MPRIS2 matched MyGo: \"{title}\" by \"{artist}\" ({status})")
                         return {
                             "source": player,
                             "title": title,
@@ -408,6 +434,7 @@ def update_activity(track):
     current_track = track
 
     if not ipc.handshaked:
+        debug_log(f"Handshake not complete yet; cached track \"{track.get('title') if track else ''}\"")
         return
 
     if not track or track.get("status") == "Stopped":
@@ -447,6 +474,11 @@ def update_activity(track):
 
     # Cross-reference with session.json
     details = resolve_track_details(track.get("title"), track.get("artist"))
+    if details:
+        debug_log(f"Matched session queue item: \"{details.get('name')}\" (Source: {details.get('source')})")
+    else:
+        debug_log(f"No session.json queue match for \"{track.get('title')}\" by \"{track.get('artist')}\"")
+
     if dur_sec == 0 and details and details.get("duration", 0) > 0:
         dur_sec = int(details["duration"] / 1000)
 
@@ -475,10 +507,18 @@ def update_activity(track):
     source_label = format_source_label(song_source, song_url)
 
     # Artwork resolution with online fallback search
-    cover_url = track.get("imageUrl") or (details.get("album", {}).get("imageUrl") if details else None)
+    raw_cover = track.get("imageUrl") or (details.get("album", {}).get("imageUrl") if details else None)
+    cover_url = None
+    if raw_cover and re.match(r"^https?://", raw_cover):
+        cover_url = raw_cover
+    elif raw_cover:
+        debug_log(f"Filtered out local/non-HTTP cover URL: {raw_cover}")
+
     if not cover_url:
+        debug_log(f"Querying NetEase cover search fallback for \"{track.get('title')}\" by \"{track.get('artist')}\"...")
         cover_url = search_cover(track.get("title"), track.get("artist"))
-    if not cover_url:
+    if not cover_url or not re.match(r"^https?://", cover_url):
+        debug_log("Falling back to default icon for cover art")
         cover_url = DEFAULT_ICON
 
     # Schedule background retry if details or cover not resolved yet
@@ -486,24 +526,52 @@ def update_activity(track):
         if retry_attempt < len(retry_delays):
             pending_retry_time = time.time() + retry_delays[retry_attempt]
             last_track_obj = track
+            debug_log(f"Scheduled retry stage {retry_attempt + 1} in {retry_delays[retry_attempt]}s")
 
     key = f"{track.get('title')}|{track.get('artist')}|{track.get('album')}|{track.get('status')}|{is_paused}|{start_sec}|{source_label}|{song_url}|{cover_url}"
     if key == last_activity_key:
         return
 
-    header_name = f"{track.get('artist')} - {track.get('title')}" if track.get("artist") else track.get("title")
+    # Discord RPC Payload Sanitization (Strict Schema Compliance)
+    title_str = str(track.get("title") or "")
+    if len(title_str) < 2:
+        title_str = f"{title_str} "
+    if len(title_str) > 128:
+        title_str = title_str[:125] + "..."
+        debug_log(f"Title truncated to 128 characters: {title_str}")
+
+    artist_str = str(track.get("artist") or "")
+    state_str = f"{artist_str} (Paused)" if (is_paused and artist_str) else ("Paused" if is_paused else artist_str)
+
+    header_name = f"{artist_str} - {title_str}" if artist_str else title_str
+    if len(header_name) > 128:
+        header_name = header_name[:125] + "..."
 
     activity = {
         "type": 2,
         "name": header_name,
-        "details": track.get("title"),
-        "state": f"{track.get('artist')} (Paused)" if is_paused else track.get("artist"),
-        "assets": {
-            "large_image": cover_url,
-            "large_text": track.get("album") or track.get("title"),
-            "small_image": DEFAULT_ICON,
-            "small_text": "MyGo Music (Paused)" if is_paused else "MyGo Music",
-        },
+        "details": title_str,
+    }
+
+    # Discord rejects empty state (""). Omit if empty or < 2 characters
+    if state_str and len(state_str.strip()) >= 2:
+        if len(state_str) > 128:
+            state_str = state_str[:125] + "..."
+        activity["state"] = state_str
+    else:
+        debug_log("Omitted state property (artist empty or < 2 characters to satisfy Discord validation)")
+
+    large_text = str(track.get("album") or title_str)
+    if len(large_text) > 128:
+        large_text = large_text[:125] + "..."
+    if len(large_text) < 2:
+        large_text = f"{large_text} "
+
+    activity["assets"] = {
+        "large_image": cover_url,
+        "large_text": large_text,
+        "small_image": DEFAULT_ICON,
+        "small_text": "MyGo Music (Paused)" if is_paused else "MyGo Music",
     }
 
     if not is_paused and start_sec > 0:
@@ -511,9 +579,13 @@ def update_activity(track):
         if end_sec > start_sec:
             activity["timestamps"]["end"] = end_sec
 
+    # buttons: max 2 buttons, label <= 32 chars, url <= 512 chars (must be http/https)
     buttons = []
-    if source_label and song_url and re.match(r"^https?://", song_url):
-        buttons.append({"label": f"Listen on {source_label}", "url": song_url})
+    if source_label and song_url and re.match(r"^https?://", song_url) and len(song_url) <= 512:
+        b_label = f"Listen on {source_label}"
+        if len(b_label) > 32:
+            b_label = b_label[:32]
+        buttons.append({"label": b_label, "url": song_url})
     buttons.append({"label": "Download MyGo Music", "url": DOWNLOAD_URL})
 
     activity["buttons"] = buttons
@@ -532,61 +604,102 @@ def update_activity(track):
         last_activity_key = key
         btn_desc = f"[{source_label} + Download]" if source_label else "[Download only]"
         cov_desc = "[Cover: OK]" if cover_url != DEFAULT_ICON else "[Cover: Default]"
-        log(f"Updated Discord Presence: \"{track.get('title')}\" by {track.get('artist')} ({track.get('status')}) {btn_desc} {cov_desc}")
+        log(f"Updated Discord Presence: \"{title_str}\" {('by ' + artist_str + ' ') if artist_str else ''}(Status: {track.get('status')}) {btn_desc} {cov_desc}")
 
 def on_ipc_ready():
     global last_activity_key
     last_activity_key = ""
     if current_track:
+        debug_log("Handshake finished, immediately updating queued track")
         update_activity(current_track)
 
 ipc.on_ready = on_ipc_ready
 
 # -------------------------------------------------------------
-# 6. Main Loop
+# 6. Graceful Shutdown & Cleanup Handler
+# -------------------------------------------------------------
+is_stopping = False
+
+def cleanup(signum=None, frame=None):
+    global is_stopping
+    if is_stopping:
+        return
+    is_stopping = True
+
+    log("Shutting down Linux Native Bridge (clearing Discord presence)...")
+    try:
+        if ipc and ipc.sock:
+            ipc.send_frame(1, {
+                "cmd": "SET_ACTIVITY",
+                "args": {"pid": os.getpid(), "activity": None},
+                "nonce": str(time.time()),
+            })
+            time.sleep(0.06)
+            ipc.close()
+    except Exception:
+        pass
+    try:
+        if os.path.exists(pid_file):
+            os.remove(pid_file)
+    except Exception:
+        pass
+    log("Bridge shutdown complete.")
+    if signum is not None:
+        sys.exit(0)
+
+signal.signal(signal.SIGINT, cleanup)
+signal.signal(signal.SIGTERM, cleanup)
+
+# -------------------------------------------------------------
+# 7. Main Loop
 # -------------------------------------------------------------
 log("Native Linux Bridge active. Monitoring MPRIS2 and Discord IPC...")
 
-while True:
-    if not ipc.sock:
-        ipc.connect()
+try:
+    while True:
+        if not ipc.sock:
+            ipc.connect()
 
-    ipc.check_incoming()
+        ipc.check_incoming()
 
-    found = query_playerctl()
-    if not found:
-        found = query_session_fallback()
+        found = query_playerctl()
+        if not found:
+            found = query_session_fallback()
 
-    if found and found.get("title"):
-        missing_count = 0
-        meta_key = f"{found.get('title')}|{found.get('artist')}|{found.get('album')}|{found.get('status')}"
-        seek_changed = abs(found.get("startTime", 0) - last_start_sec) >= 2
-        state_changed = meta_key != last_meta_key
+        if found and found.get("title"):
+            missing_count = 0
+            meta_key = f"{found.get('title')}|{found.get('artist')}|{found.get('album')}|{found.get('status')}"
+            seek_changed = abs(found.get("startTime", 0) - last_start_sec) >= 2
+            state_changed = meta_key != last_meta_key
 
-        if state_changed or (found.get("status") == "Playing" and seek_changed):
-            last_meta_key = meta_key
-            last_start_sec = found.get("startTime", 0)
-            retry_attempt = 0
-            update_activity(found)
-    else:
-        missing_count += 1
-        if missing_count >= 3 and last_meta_key != "__stopped":
-            last_meta_key = "__stopped"
-            last_start_sec = 0
-            retry_attempt = 0
-            update_activity(None)
+            if state_changed or (found.get("status") == "Playing" and seek_changed):
+                last_meta_key = meta_key
+                last_start_sec = found.get("startTime", 0)
+                retry_attempt = 0
+                update_activity(found)
+        else:
+            missing_count += 1
+            if missing_count >= 3 and last_meta_key != "__stopped":
+                last_meta_key = "__stopped"
+                last_start_sec = 0
+                retry_attempt = 0
+                debug_log(f"No media detected after {missing_count} ticks, clearing presence")
+                update_activity(None)
 
-    # Asynchronous retry for enriched details & cover
-    if pending_retry_time > 0 and time.time() >= pending_retry_time:
-        pending_retry_time = 0
-        retry_attempt += 1
-        if last_track_obj and last_meta_key != "__stopped":
-            fresh_details = resolve_track_details(last_track_obj.get("title"), last_track_obj.get("artist"), True)
-            if fresh_details:
-                log(f"Enriched track details and artwork from session for \"{last_track_obj.get('title')}\"")
-                last_activity_key = ""
-                update_activity(last_track_obj)
-            elif retry_attempt < len(retry_delays):
-                pending_retry_time = time.time() + retry_delays[retry_attempt]
+        # Asynchronous retry for enriched details & cover
+        if pending_retry_time > 0 and time.time() >= pending_retry_time:
+            pending_retry_time = 0
+            retry_attempt += 1
+            if last_track_obj and last_meta_key != "__stopped":
+                fresh_details = resolve_track_details(last_track_obj.get("title"), last_track_obj.get("artist"), True)
+                if fresh_details:
+                    log(f"Enriched track details and artwork from session for \"{last_track_obj.get('title')}\"")
+                    last_activity_key = ""
+                    update_activity(last_track_obj)
+                elif retry_attempt < len(retry_delays):
+                    pending_retry_time = time.time() + retry_delays[retry_attempt]
+                    debug_log(f"Rescheduled retry stage {retry_attempt + 1} in {retry_delays[retry_attempt]}s")
 
-    time.sleep(0.3)
+        time.sleep(0.3)
+finally:
+    cleanup()

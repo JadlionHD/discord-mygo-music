@@ -6,7 +6,14 @@
 import Foundation
 
 let defaultClientId = "631447533323026432"
-let clientId = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : (ProcessInfo.processInfo.environment["DISCORD_CLIENT_ID"] ?? defaultClientId)
+let isDebug = CommandLine.arguments.contains("--debug")
+    || CommandLine.arguments.contains("-debug")
+    || CommandLine.arguments.contains("-d")
+    || CommandLine.arguments.contains("-Debug")
+    || ProcessInfo.processInfo.environment["DISCORD_RPC_DEBUG"] == "1"
+
+let nonFlagArgs = CommandLine.arguments.dropFirst().filter { !$0.hasPrefix("-") }
+let clientId = nonFlagArgs.first ?? (ProcessInfo.processInfo.environment["DISCORD_CLIENT_ID"] ?? defaultClientId)
 let defaultIcon = "https://raw.githubusercontent.com/egoist/mygo-music/main/resources/icon.png"
 let downloadUrl = "https://music.egoist.dev/"
 var coverCache: [String: String] = [:]
@@ -18,7 +25,15 @@ func logMessage(_ msg: String) {
     fflush(stdout)
 }
 
-logMessage("Starting macOS Native Discord RPC Bridge (Client ID: \(clientId))")
+func debugLog(_ msg: String) {
+    guard isDebug else { return }
+    let formatter = ISO8601DateFormatter()
+    let ts = formatter.string(from: Date())
+    print("[\(ts)] [discord-mygo-music-debug] \(msg)")
+    fflush(stdout)
+}
+
+logMessage("Starting macOS Native Discord RPC Bridge (Client ID: \(clientId), Debug: \(isDebug ? "ENABLED" : "DISABLED"))")
 
 // Single Instance via /tmp/discord-mygo-music.pid
 let pidFile = "/tmp/discord-mygo-music.pid"
@@ -52,6 +67,8 @@ func searchCover(title: String, artist: String) -> String? {
         return nil
     }
 
+    debugLog("Querying NetEase HD cover fallback: \(url.absoluteString)")
+
     var request = URLRequest(url: url)
     request.timeoutInterval = 2.5
     request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120 Safari/537.36", forHTTPHeaderField: "User-Agent")
@@ -81,6 +98,7 @@ func searchCover(title: String, artist: String) -> String? {
 
     if let pic = foundPic {
         coverCache[key] = pic
+        debugLog("Resolved NetEase HD cover: \(pic)")
         return pic
     }
     coverCache[key] = nil
@@ -192,12 +210,18 @@ class DiscordIPC {
     }
 
     func handshake() {
+        debugLog("Dispatching Discord IPC Handshake (Opcode 0, Client ID: \(appId))")
         sendFrame(opcode: 0, payload: ["v": 1, "client_id": appId])
     }
 
     func sendFrame(opcode: Int32, payload: [String: Any]) {
         guard fd >= 0,
               let data = try? JSONSerialization.data(withJSONObject: payload, options: []) else { return }
+
+        if opcode == 1, let cmd = payload["cmd"] as? String, cmd == "SET_ACTIVITY",
+           let jsonStr = String(data: data, encoding: .utf8) {
+            debugLog("Sending SET_ACTIVITY frame: \(jsonStr)")
+        }
 
         var op = opcode.littleEndian
         var len = Int32(data.count).littleEndian
@@ -223,11 +247,18 @@ class DiscordIPC {
                 var buf = [UInt8](repeating: 0, count: length)
                 _ = Darwin.read(fd, &buf, length)
                 if let str = String(bytes: buf, encoding: .utf8) {
-                    if str.contains("\"READY\"") {
-                        logMessage("Discord RPC Ready!")
-                        isReady = true
-                        onReady?()
+                    if opcode == 1 {
+                        if str.contains("\"READY\"") {
+                            logMessage("Discord RPC Ready!")
+                            isReady = true
+                            onReady?()
+                        } else if str.contains("\"evt\":\"ERROR\"") || str.contains("\"evt\": \"ERROR\"") {
+                            logMessage("DISCORD RPC ERROR: \(str)")
+                        } else {
+                            debugLog("Discord Frame (Opcode 1): \(str)")
+                        }
                     } else if opcode == 3, let msg = try? JSONSerialization.jsonObject(with: Data(buf)) as? [String: Any] {
+                        debugLog("Received PING, replying PONG")
                         sendFrame(opcode: 4, payload: msg)
                     }
                 }
@@ -249,13 +280,28 @@ var currentTrackData: [String: Any]?
 func dispatchTrack(_ cur: [String: Any], sess: [String: Any]) {
     currentTrackData = cur
 
-    guard ipc.isReady else { return }
+    guard ipc.isReady else {
+        debugLog("Handshake not ready yet, cached track data")
+        return
+    }
 
-    let name = cur["name"] as? String ?? ""
+    var name = cur["name"] as? String ?? ""
+    if name.count < 2 {
+        name = "\(name) "
+    }
+    if name.count > 128 {
+        name = String(name.prefix(125)) + "..."
+        debugLog("Title truncated to 128 characters: \(name)")
+    }
+
     var artistStr = ""
     if let artists = cur["artists"] as? [[String: Any]] {
         artistStr = artists.compactMap { $0["name"] as? String }.joined(separator: ", ")
     }
+    if artistStr.count > 128 {
+        artistStr = String(artistStr.prefix(125)) + "..."
+    }
+
     let albumStr = (cur["album"] as? [String: Any])?["name"] as? String ?? ""
     let durMs = cur["duration"] as? Double ?? 0
     let durSec = Int64(durMs / 1000.0)
@@ -282,11 +328,21 @@ func dispatchTrack(_ cur: [String: Any], sess: [String: Any]) {
 
     let sourceLabel = formatSourceLabel(source: source, url: songUrl)
 
-    var coverUrl = (cur["album"] as? [String: Any])?["imageUrl"] as? String
+    // Artwork resolution: discard non-http (file:///) URLs
+    let rawCover = (cur["album"] as? [String: Any])?["imageUrl"] as? String
+    var coverUrl: String?
+    if let raw = rawCover, raw.hasPrefix("http://") || raw.hasPrefix("https://") {
+        coverUrl = raw
+    } else if let raw = rawCover {
+        debugLog("Filtered out local/non-HTTP cover URL: \(raw)")
+    }
+
     if coverUrl == nil || coverUrl!.isEmpty {
+        debugLog("Querying NetEase cover search fallback for \"\(name)\" by \"\(artistStr)\"...")
         coverUrl = searchCover(title: name, artist: artistStr)
     }
-    if coverUrl == nil || coverUrl!.isEmpty {
+    if coverUrl == nil || coverUrl!.isEmpty || (!coverUrl!.hasPrefix("http://") && !coverUrl!.hasPrefix("https://")) {
+        debugLog("Falling back to default icon for cover art")
         coverUrl = defaultIcon
     }
 
@@ -294,19 +350,24 @@ func dispatchTrack(_ cur: [String: Any], sess: [String: Any]) {
     if activityKey == lastActivityKey { return }
 
     var buttons: [[String: String]] = []
-    if let sl = sourceLabel, let u = songUrl, u.hasPrefix("http") {
-        buttons.append(["label": "Listen on \(sl)", "url": u])
+    if let sl = sourceLabel, let u = songUrl, u.hasPrefix("http") && u.count <= 512 {
+        var label = "Listen on \(sl)"
+        if label.count > 32 { label = String(label.prefix(32)) }
+        buttons.append(["label": label, "url": u])
     }
     buttons.append(["label": "Download MyGo Music", "url": downloadUrl])
 
-    let activity: [String: Any] = [
+    var largeText = albumStr.isEmpty ? name : albumStr
+    if largeText.count > 128 { largeText = String(largeText.prefix(125)) + "..." }
+    if largeText.count < 2 { largeText = "\(largeText) " }
+
+    var activity: [String: Any] = [
         "type": 2,
         "name": artistStr.isEmpty ? name : "\(artistStr) - \(name)",
         "details": name,
-        "state": artistStr,
         "assets": [
             "large_image": coverUrl ?? defaultIcon,
-            "large_text": albumStr.isEmpty ? name : albumStr,
+            "large_text": largeText,
             "small_image": defaultIcon,
             "small_text": "MyGo Music"
         ],
@@ -318,6 +379,13 @@ func dispatchTrack(_ cur: [String: Any], sess: [String: Any]) {
         "metadata": ["button_urls": buttons.map { $0["url"] ?? "" }]
     ]
 
+    // Discord rejects empty state (""). Omit if empty or < 2 characters
+    if !artistStr.trimmingCharacters(in: .whitespaces).isEmpty && artistStr.count >= 2 {
+        activity["state"] = artistStr
+    } else {
+        debugLog("Omitted state property (artist empty or < 2 characters to satisfy Discord validation)")
+    }
+
     ipc.sendFrame(opcode: 1, payload: [
         "cmd": "SET_ACTIVITY",
         "args": ["pid": getpid(), "activity": activity],
@@ -327,11 +395,12 @@ func dispatchTrack(_ cur: [String: Any], sess: [String: Any]) {
     lastActivityKey = activityKey
     let btnDesc = sourceLabel != nil ? "[\(sourceLabel!) + Download]" : "[Download only]"
     let covDesc = coverUrl != defaultIcon ? "[Cover: OK]" : "[Cover: Default]"
-    logMessage("Updated Discord Presence: \"\(name)\" by \(artistStr) (Playing) \(btnDesc) \(covDesc)")
+    logMessage("Updated Discord Presence: \"\(name)\" \(!artistStr.isEmpty ? "by \(artistStr) " : "")(Playing) \(btnDesc) \(covDesc)")
 }
 
 ipc.onReady = {
     lastActivityKey = ""
+    debugLog("Discord RPC Ready handler triggered")
     if let sess = getSessionData(),
        let queue = sess["queue"] as? [[String: Any]], !queue.isEmpty {
         var idx = sess["at"] as? Int ?? 0
@@ -344,6 +413,38 @@ ipc.onReady = {
         }
     }
 }
+
+// Graceful Shutdown & Cleanup Handler
+var isStopping = false
+func cleanup() {
+    guard !isStopping else { return }
+    isStopping = true
+    logMessage("Shutting down macOS Native Bridge (clearing Discord presence)...")
+    if ipc.fd >= 0 {
+        ipc.sendFrame(opcode: 1, payload: [
+            "cmd": "SET_ACTIVITY",
+            "args": ["pid": getpid(), "activity": NSNull()],
+            "nonce": UUID().uuidString
+        ])
+        usleep(60000)
+        close(ipc.fd)
+        ipc.fd = -1
+    }
+    try? FileManager.default.removeItem(atPath: pidFile)
+    logMessage("Bridge shutdown complete.")
+    exit(0)
+}
+
+let sigIntSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+sigIntSource.setEventHandler { cleanup() }
+sigIntSource.resume()
+
+let sigTermSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+sigTermSource.setEventHandler { cleanup() }
+sigTermSource.resume()
+
+signal(SIGINT, SIG_IGN)
+signal(SIGTERM, SIG_IGN)
 
 logMessage("Native macOS Bridge active. Polling media updates...")
 

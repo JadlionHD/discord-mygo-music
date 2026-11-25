@@ -14,7 +14,7 @@ function addLog(msg) {
   const ts = new Date().toLocaleTimeString();
   const entry = `[${ts}] ${msg}`;
   bridgeLogs.unshift(entry);
-  if (bridgeLogs.length > 30) bridgeLogs.pop();
+  if (bridgeLogs.length > 60) bridgeLogs.pop();
   console.log(`[discord-mygo-music] ${msg}`);
 }
 
@@ -27,11 +27,11 @@ function getNativeConfig() {
       runtimeInfo: "PowerShell 5.1+ (.NET NamedPipe & WinRT GSMTC)",
       cmd: "powershell.exe",
       scriptName: "bridge-windows.ps1",
-      makeArgs: (scriptPath, clientId) => [
+      makeArgs: (scriptPath, clientId, isDebug) => [
         "-ExecutionPolicy", "Bypass",
         "-NoProfile",
         "-Command",
-        `& { $p = '${scriptPath}'; if (-not (Test-Path $p)) { $p = Join-Path $env:APPDATA 'MyGo Music\\plugins\\discord-mygo-music-dev\\bridge-windows.ps1' }; if (-not (Test-Path $p)) { $p = Join-Path $env:APPDATA 'MyGo Music\\plugins\\discord-mygo-music\\bridge-windows.ps1' }; if (-not (Test-Path $p)) { $p = 'bridge-windows.ps1' }; & $p '${clientId}' }`
+        `& { $p = '${scriptPath}'; if (-not (Test-Path $p)) { $p = Join-Path $env:APPDATA 'MyGo Music\\plugins\\discord-mygo-music-dev\\bridge-windows.ps1' }; if (-not (Test-Path $p)) { $p = Join-Path $env:APPDATA 'MyGo Music\\plugins\\discord-mygo-music\\bridge-windows.ps1' }; if (-not (Test-Path $p)) { $p = 'bridge-windows.ps1' }; & $p '${clientId}' ${isDebug ? '-debug' : ''} }`
       ]
     };
   }
@@ -42,7 +42,11 @@ function getNativeConfig() {
       runtimeInfo: "Swift & MediaRemote Framework",
       cmd: "swift",
       scriptName: "bridge-macos.swift",
-      makeArgs: (scriptPath, clientId) => [scriptPath, clientId]
+      makeArgs: (scriptPath, clientId, isDebug) => [
+        scriptPath,
+        clientId,
+        ...(isDebug ? ["-debug"] : [])
+      ]
     };
   }
 
@@ -52,7 +56,11 @@ function getNativeConfig() {
     runtimeInfo: "Python 3 & MPRIS2 playerctl",
     cmd: "python3",
     scriptName: "bridge-linux.py",
-    makeArgs: (scriptPath, clientId) => [scriptPath, clientId]
+    makeArgs: (scriptPath, clientId, isDebug) => [
+      scriptPath,
+      clientId,
+      ...(isDebug ? ["-debug"] : [])
+    ]
   };
 }
 
@@ -139,12 +147,21 @@ async function ensureBridge(force = false) {
   addLog("Ensuring Native Discord RPC Bridge is active...");
   const cfg = getNativeConfig();
   const clientId = (host.setting && host.setting("discordClientId")) ? host.setting("discordClientId") : DEFAULT_CLIENT_ID;
+  const isDebug = Boolean(
+    host.setting && (
+      host.setting("debugMode") === true ||
+      host.setting("debugMode") === "true" ||
+      host.setting("debugMode") === "1" ||
+      host.setting("debugMode") === 1
+    )
+  );
+
   const scriptCandidates = await resolveScriptCandidates(cfg);
 
   for (const scriptPath of scriptCandidates) {
     try {
-      addLog(`Spawning ${cfg.cmd} with: ${scriptPath}`);
-      const args = cfg.makeArgs(scriptPath, clientId);
+      addLog(`Spawning ${cfg.cmd} with: ${scriptPath} (Debug: ${isDebug ? "ENABLED" : "DISABLED"})`);
+      const args = cfg.makeArgs(scriptPath, clientId, isDebug);
 
       const proc = host.spawn(cfg.cmd, args);
       bridgeProcess = proc;
@@ -189,6 +206,14 @@ export async function home() {
   ensureBridge().catch(() => {});
   const cfg = getNativeConfig();
   const clientId = (host.setting && host.setting("discordClientId")) ? host.setting("discordClientId") : DEFAULT_CLIENT_ID;
+  const isDebug = Boolean(
+    host.setting && (
+      host.setting("debugMode") === true ||
+      host.setting("debugMode") === "true" ||
+      host.setting("debugMode") === "1" ||
+      host.setting("debugMode") === 1
+    )
+  );
 
   const bridgeStatusText = bridgeProcess
     ? `${t("Active via")} ${cfg.name}`
@@ -223,6 +248,13 @@ export async function home() {
             album: { id: "", name: "RPC App", imageUrl: "" },
             duration: 0,
           },
+          {
+            id: "diag-debug",
+            name: t("Debug Diagnostics"),
+            artists: [{ id: "", name: isDebug ? "Enabled (-Debug flag active)" : "Disabled" }],
+            album: { id: "", name: isDebug ? "ON" : "OFF", imageUrl: "" },
+            duration: 0,
+          },
         ],
         albums: [],
         artists: [],
@@ -241,6 +273,14 @@ export async function browse({ page }) {
 
     const cfg = getNativeConfig();
     const clientId = (host.setting && host.setting("discordClientId")) ? host.setting("discordClientId") : DEFAULT_CLIENT_ID;
+    const isDebug = Boolean(
+      host.setting && (
+        host.setting("debugMode") === true ||
+        host.setting("debugMode") === "true" ||
+        host.setting("debugMode") === "1" ||
+        host.setting("debugMode") === 1
+      )
+    );
 
     const diagTracks = [
       {
@@ -265,6 +305,13 @@ export async function browse({ page }) {
         duration: 0,
       },
       {
+        id: "dbg-mode",
+        name: "Debug Mode",
+        artists: [{ id: "", name: isDebug ? "ENABLED (-Debug flag active, verbose tracing)" : "DISABLED (Enable in Settings > Plugins)" }],
+        album: { id: "", name: isDebug ? "ON" : "OFF", imageUrl: "" },
+        duration: 0,
+      },
+      {
         id: "dbg-client",
         name: "Discord Application ID",
         artists: [{ id: "", name: clientId }],
@@ -281,10 +328,10 @@ export async function browse({ page }) {
     ];
 
     const logTracks = bridgeLogs.length > 0
-      ? bridgeLogs.slice(0, 15).map((line, idx) => ({
+      ? bridgeLogs.slice(0, 25).map((line, idx) => ({
           id: `dbg-log-${idx}`,
           name: line,
-          artists: [{ id: "", name: "Log entry" }],
+          artists: [{ id: "", name: "Log record" }],
           album: { id: "", name: `#${idx + 1}`, imageUrl: "" },
           duration: 0,
         }))
@@ -309,7 +356,7 @@ export async function browse({ page }) {
           playlists: [],
         },
         {
-          title: "Activity Records / Real-Time Logs (Last 15)",
+          title: "Activity Records / Real-Time Logs (Last 25)",
           tracks: logTracks,
           albums: [],
           artists: [],
