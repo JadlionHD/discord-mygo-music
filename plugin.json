@@ -1,12 +1,12 @@
 {
   "id": "discord-mygo-music",
   "name": "Discord Rich Presence",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "minAppVersion": "0.1.8",
   "main": "index.js",
   "playback": "stream",
   "permissions": {
-    "network": ["music.163.com"],
+    "network": [],
     "process": [
       "powershell.exe",
       "powershell",
